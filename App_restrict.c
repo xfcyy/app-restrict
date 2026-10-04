@@ -1,6 +1,6 @@
 /*
  * App_restrict - 短视频应用无触控息屏守护进程
- * 【终极可配置版】
+ * 【终极省电版】- 优先使用轻量级命令检测前台应用
  */
 
 #include <stdio.h>
@@ -32,7 +32,7 @@
 
 /* 全局可配置参数（默认值） */
 static int g_screen_check_interval = 10;   /* 屏幕状态检查间隔（秒） */
-static int g_fg_check_interval = 30;       /* 前台应用检查间隔（秒） */
+static int g_fg_check_interval = 120;      /* 前台应用检查间隔（秒），默认改为 120 秒，极大降低开销 */
 static int g_config_check_interval = 30;   /* 配置文件检查间隔（秒） */
 static int g_idle_sleep_sec = 5;           /* 非目标应用前台的休眠时间（秒） */
 static int g_touch_epoll_timeout_ms = 1000;/* 触摸轮询超时（毫秒） */
@@ -158,25 +158,49 @@ static bool is_valid_package(const char *pkg) {
     return true;
 }
 
+/* 
+ * 【优化点】：前台应用检测优先级重排
+ * 1. mCurrentFocus (最轻)
+ * 2. mFocusedApp (中等)
+ * 3. mResumedActivity (最重，仅在前面失效时使用，用于兜底全屏播放的场景)
+ */
 static bool get_foreground_package(char *out, size_t outsize) {
     if (!out || outsize == 0) return false;
     out[0] = '\0';
-    char buf[CMD_BUFFER_SIZE];
 
-    if (exec_cmd("/system/bin/dumpsys activity activities 2>/dev/null | grep -m1 mResumedActivity", buf, sizeof(buf)) == 0) {
-        char *p = strstr(buf, "mResumedActivity:");
-        if (p && parse_package(p + 16, out, outsize) && is_valid_package(out)) return true;
-    }
-    if (exec_cmd("/system/bin/dumpsys window 2>/dev/null | grep -m1 mFocusedApp", buf, sizeof(buf)) == 0) {
-        char *p = strstr(buf, "mFocusedApp=");
-        if (p && parse_package(p + 12, out, outsize) && is_valid_package(out)) return true;
-    }
+    char buf[CMD_BUFFER_SIZE];
+    bool has_valid = false;
+
+    // 1. 优先尝试极轻量的 mCurrentFocus
     if (exec_cmd("/system/bin/dumpsys window 2>/dev/null | grep -m1 mCurrentFocus", buf, sizeof(buf)) == 0) {
         char *p = strstr(buf, "mCurrentFocus=");
-        if (p && parse_package(p + 15, out, outsize) && is_valid_package(out)) return true;
+        if (p && parse_package(p + 15, out, outsize) && is_valid_package(out)) {
+            has_valid = true;
+        }
     }
-    out[0] = '\0';
-    return false;
+
+    // 2. 如果没解析到，或者解析到的是 systemui 这种无效包，尝试 mFocusedApp（中等开销）
+    if (!has_valid) {
+        if (exec_cmd("/system/bin/dumpsys window 2>/dev/null | grep -m1 mFocusedApp", buf, sizeof(buf)) == 0) {
+            char *p = strstr(buf, "mFocusedApp=");
+            if (p && parse_package(p + 12, out, outsize) && is_valid_package(out)) {
+                has_valid = true;
+            }
+        }
+    }
+
+    // 3. 依然没解析到，或者遇到特殊机型（比如全屏视频），才会执行最重的 mResumedActivity 兜底
+    if (!has_valid) {
+        if (exec_cmd("/system/bin/dumpsys activity activities 2>/dev/null | grep -m1 mResumedActivity", buf, sizeof(buf)) == 0) {
+            char *p = strstr(buf, "mResumedActivity:");
+            if (p && parse_package(p + 16, out, outsize) && is_valid_package(out)) {
+                has_valid = true;
+            }
+        }
+    }
+
+    if (!has_valid) out[0] = '\0';
+    return has_valid;
 }
 
 static bool get_screen_state(void) {
@@ -329,7 +353,6 @@ static int load_config(const char *path) {
         trim_inplace(val);
         if (key[0] == '\0') continue;
 
-        /* 新增：解析全局时序配置 */
         if (strcmp(key, "screen_interval") == 0) {
             int v = atoi(val); if (v > 0) g_screen_check_interval = v;
         } else if (strcmp(key, "fg_interval") == 0) {
@@ -340,9 +363,7 @@ static int load_config(const char *path) {
             int v = atoi(val); if (v > 0) g_idle_sleep_sec = v;
         } else if (strcmp(key, "touch_timeout") == 0) {
             int v = atoi(val); if (v > 0) g_touch_epoll_timeout_ms = v;
-        } 
-        /* 原有：解析应用配置 */
-        else if (strcmp(key, "package") == 0) {
+        } else if (strcmp(key, "package") == 0) {
             if (n >= MAX_APPS) continue;
             cur = &tmp[n++];
             memset(cur, 0, sizeof(*cur));
