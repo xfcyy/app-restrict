@@ -1,6 +1,6 @@
 /*
  * App_restrict - 短视频应用无触控息屏守护进程
- * 【终极省电版】- 优先使用轻量级命令检测前台应用
+ * 【第二版 - 前台检测顺序优化，其余保持原状】
  */
 
 #include <stdio.h>
@@ -30,12 +30,12 @@
 #define MAX_DEVICES 16
 #define DEFAULT_LIMIT_SEC (15 * 60)
 
-/* 全局可配置参数（默认值） */
-static int g_screen_check_interval = 10;   /* 屏幕状态检查间隔（秒） */
-static int g_fg_check_interval = 120;      /* 前台应用检查间隔（秒），默认改为 120 秒，极大降低开销 */
-static int g_config_check_interval = 30;   /* 配置文件检查间隔（秒） */
-static int g_idle_sleep_sec = 5;           /* 非目标应用前台的休眠时间（秒） */
-static int g_touch_epoll_timeout_ms = 1000;/* 触摸轮询超时（毫秒） */
+/* 全局可配置参数（默认值，不在代码里修改，一切从配置文件读取） */
+static int g_screen_check_interval = 10;
+static int g_fg_check_interval = 30;
+static int g_config_check_interval = 30;
+static int g_idle_sleep_sec = 5;
+static int g_touch_epoll_timeout_ms = 1000;
 
 #ifndef BITS_PER_LONG
 #define BITS_PER_LONG (sizeof(long) * 8)
@@ -159,50 +159,45 @@ static bool is_valid_package(const char *pkg) {
 }
 
 /* 
- * 【优化点】：前台应用检测优先级重排
- * 1. mCurrentFocus (最轻)
+ * 【第二版修改点】：前台应用检测梯次退让逻辑（轻 -> 中 -> 重）
+ * 1. mCurrentFocus (最轻量)
  * 2. mFocusedApp (中等)
- * 3. mResumedActivity (最重，仅在前面失效时使用，用于兜底全屏播放的场景)
+ * 3. mResumedActivity (最重，仅在前两者失效时立即执行，无周期等待)
  */
 static bool get_foreground_package(char *out, size_t outsize) {
     if (!out || outsize == 0) return false;
     out[0] = '\0';
-
     char buf[CMD_BUFFER_SIZE];
-    bool has_valid = false;
 
     // 1. 优先尝试极轻量的 mCurrentFocus
     if (exec_cmd("/system/bin/dumpsys window 2>/dev/null | grep -m1 mCurrentFocus", buf, sizeof(buf)) == 0) {
         char *p = strstr(buf, "mCurrentFocus=");
         if (p && parse_package(p + 15, out, outsize) && is_valid_package(out)) {
-            has_valid = true;
+            return true;
         }
     }
 
-    // 2. 如果没解析到，或者解析到的是 systemui 这种无效包，尝试 mFocusedApp（中等开销）
-    if (!has_valid) {
-        if (exec_cmd("/system/bin/dumpsys window 2>/dev/null | grep -m1 mFocusedApp", buf, sizeof(buf)) == 0) {
-            char *p = strstr(buf, "mFocusedApp=");
-            if (p && parse_package(p + 12, out, outsize) && is_valid_package(out)) {
-                has_valid = true;
-            }
+    // 2. 如果失败，立即执行 mFocusedApp (中等开销)
+    if (exec_cmd("/system/bin/dumpsys window 2>/dev/null | grep -m1 mFocusedApp", buf, sizeof(buf)) == 0) {
+        char *p = strstr(buf, "mFocusedApp=");
+        if (p && parse_package(p + 12, out, outsize) && is_valid_package(out)) {
+            return true;
         }
     }
 
-    // 3. 依然没解析到，或者遇到特殊机型（比如全屏视频），才会执行最重的 mResumedActivity 兜底
-    if (!has_valid) {
-        if (exec_cmd("/system/bin/dumpsys activity activities 2>/dev/null | grep -m1 mResumedActivity", buf, sizeof(buf)) == 0) {
-            char *p = strstr(buf, "mResumedActivity:");
-            if (p && parse_package(p + 16, out, outsize) && is_valid_package(out)) {
-                has_valid = true;
-            }
+    // 3. 如果依然失败，立即执行最重的 mResumedActivity 兜底
+    if (exec_cmd("/system/bin/dumpsys activity activities 2>/dev/null | grep -m1 mResumedActivity", buf, sizeof(buf)) == 0) {
+        char *p = strstr(buf, "mResumedActivity:");
+        if (p && parse_package(p + 16, out, outsize) && is_valid_package(out)) {
+            return true;
         }
     }
 
-    if (!has_valid) out[0] = '\0';
-    return has_valid;
+    out[0] = '\0';
+    return false;
 }
 
+/* 屏幕状态检测（完全保持原逻辑，绝不妥协防烧屏底线） */
 static bool get_screen_state(void) {
     bool on = true;
     bool found = false;
@@ -233,12 +228,16 @@ static bool get_screen_state(void) {
         }
     }
     if (found) return on;
+    
+    // 失败回退 dumpsys power
     char out[512] = {0};
     if (exec_cmd("/system/bin/dumpsys power 2>/dev/null | grep -m1 mWakefulness", out, sizeof(out)) == 0) {
         if (strstr(out, "mWakefulness=Awake")) return true;
         if (strstr(out, "mWakefulness=Asleep") || strstr(out, "mWakefulness=Dozing")) return false;
     }
-    return true;
+    
+    // 终极兜底：为了防烧屏，宁可耗电，也假设屏幕亮着继续监控
+    return true; 
 }
 
 static void close_touch_devices(void) {
@@ -353,6 +352,7 @@ static int load_config(const char *path) {
         trim_inplace(val);
         if (key[0] == '\0') continue;
 
+        /* 解析全局时序配置（保持读取配置文件，不硬编码） */
         if (strcmp(key, "screen_interval") == 0) {
             int v = atoi(val); if (v > 0) g_screen_check_interval = v;
         } else if (strcmp(key, "fg_interval") == 0) {
@@ -363,7 +363,9 @@ static int load_config(const char *path) {
             int v = atoi(val); if (v > 0) g_idle_sleep_sec = v;
         } else if (strcmp(key, "touch_timeout") == 0) {
             int v = atoi(val); if (v > 0) g_touch_epoll_timeout_ms = v;
-        } else if (strcmp(key, "package") == 0) {
+        } 
+        /* 解析应用配置 */
+        else if (strcmp(key, "package") == 0) {
             if (n >= MAX_APPS) continue;
             cur = &tmp[n++];
             memset(cur, 0, sizeof(*cur));
