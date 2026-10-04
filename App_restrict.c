@@ -1,6 +1,6 @@
 /*
  * App_restrict - 短视频应用无触控息屏守护进程
- * 【第三版 - 多源交叉验证屏幕状态，修复亮屏后程序假死问题】
+ * 【第四版 - 专用休眠指令修复锁屏后自动亮屏Bug】
  */
 
 #include <stdio.h>
@@ -159,8 +159,7 @@ static bool is_valid_package(const char *pkg) {
 }
 
 /* 
- * 前台应用检测梯次退让逻辑（轻 -> 中 -> 重）
- * 严格按照一次调用内即时级联，绝不引入等待周期
+ * 前台应用检测梯次退让逻辑 (轻 -> 中 -> 重)
  */
 static bool get_foreground_package(char *out, size_t outsize) {
     if (!out || outsize == 0) return false;
@@ -196,18 +195,18 @@ static bool get_foreground_package(char *out, size_t outsize) {
 }
 
 /* 
- * 【第三版核心修改】：多源交叉验证屏幕状态
- * 1. /sys/class/graphics/fb0/blank (物理层,最权威)
- * 2. /sys/class/backlight/brightness (背光层,轻量)
- * 3. dumpsys display | grep mScreenState (系统显示层,解决唤醒延迟)
- * 4. dumpsys power | grep mWakefulness (系统电源层)
- * 5. 终极兜底:返回 true (防烧屏底线)
+ * 多源交叉验证屏幕状态
+ * 1. fb0/blank (物理层)
+ * 2. sysfs backlight (背光层)
+ * 3. dumpsys display (系统显示层)
+ * 4. dumpsys power (系统电源层)
+ * 5. 终极兜底：返回 true (防烧屏底线)
  */
 static bool get_screen_state(void) {
     bool on = true;
     bool found = false;
 
-    // 1. 物理层：fb0/blank (0为亮，非0为灭)
+    // 1. 物理层
     int fd = open("/sys/class/graphics/fb0/blank", O_RDONLY);
     if (fd >= 0) {
         char buf[32] = {0};
@@ -215,11 +214,11 @@ static bool get_screen_state(void) {
         close(fd);
         if (r > 0) {
             int val = strtol(buf, NULL, 10);
-            return (val == 0); // 0为亮屏，其他状态直接返回
+            return (val == 0);
         }
     }
 
-    // 2. 背光层：扫描 /sys/class/backlight/ 和 /sys/class/leds/
+    // 2. 背光层
     DIR *dir = opendir("/sys/class/backlight");
     if (dir) {
         struct dirent *entry;
@@ -248,20 +247,20 @@ static bool get_screen_state(void) {
     }
     if (found) return on;
 
-    // 3. 系统显示层：dumpsys display（专治亮屏后 mWakefulness 延迟问题）
+    // 3. 系统显示层
     char out[512] = {0};
     if (exec_cmd("/system/bin/dumpsys display 2>/dev/null | grep -m1 mScreenState", out, sizeof(out)) == 0) {
         if (strstr(out, "mScreenState=ON")) return true;
         if (strstr(out, "mScreenState=OFF")) return false;
     }
 
-    // 4. 系统电源层：dumpsys power 兜底
+    // 4. 系统电源层
     if (exec_cmd("/system/bin/dumpsys power 2>/dev/null | grep -m1 mWakefulness", out, sizeof(out)) == 0) {
         if (strstr(out, "mWakefulness=Awake")) return true;
         if (strstr(out, "mWakefulness=Asleep") || strstr(out, "mWakefulness=Dozing")) return false;
     }
 
-    // 5. 终极兜底：防烧屏底线，假定屏幕亮着继续监控
+    // 5. 防烧屏底线，假定屏幕亮着继续监控
     return true; 
 }
 
@@ -326,9 +325,23 @@ static bool poll_touch(int timeout_ms) {
     return touched;
 }
 
+/* 
+ * 【第四版核心修改】使用专用休眠指令，避免“双按电源键”导致锁屏立刻亮起
+ */
 static void trigger_screen_off(void) {
+    // 优先使用 KEYCODE_SLEEP (223) 专用休眠指令，只关屏不切换
+    if (exec_cmd("/system/bin/input keyevent 223", NULL, 0) == 0) {
+        sleep(2);
+        return;
+    }
+    // 部分老系统若不支持 223，尝试使用 power 服务直接休眠
+    if (exec_cmd("/system/bin/cmd power set-mode 0", NULL, 0) == 0) {
+        sleep(2);
+        return;
+    }
+    // 绝对兜底
     exec_cmd("/system/bin/input keyevent 26", NULL, 0);
-    sleep(3);
+    sleep(2);
 }
 
 static long parse_time_str(const char *s) {
@@ -377,7 +390,7 @@ static int load_config(const char *path) {
         trim_inplace(val);
         if (key[0] == '\0') continue;
 
-        /* 解析全局时序配置（保持读取配置文件） */
+        /* 解析全局时序配置 */
         if (strcmp(key, "screen_interval") == 0) {
             int v = atoi(val); if (v > 0) g_screen_check_interval = v;
         } else if (strcmp(key, "fg_interval") == 0) {
@@ -525,14 +538,14 @@ int main(int argc, char *argv[]) {
         if (active_app) {
             if (poll_touch(g_touch_epoll_timeout_ms)) {
                 active_app->last_touch = time(NULL);
-                active_app->triggered = false;
+                active_app->triggered  = false;
             }
             time_t t_now = time(NULL);
             if (!active_app->triggered && t_now - active_app->last_touch >= active_app->limit_time) {
                 LOG_I("%s 超过 %ld 秒无触摸，触发熄屏", active_app->package, (long)active_app->limit_time);
                 trigger_screen_off();
                 active_app->triggered = true;
-                last_screen_check = 0; // 强制下一轮立刻重新检查屏幕状态
+                last_screen_check = 0;
             }
         } else {
             sleep(2);
