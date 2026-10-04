@@ -20,7 +20,7 @@ jobs:
     - name: Compile Static Binary
       run: |
         chmod +x ./android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/*
-        ./android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O2 -Wall -Wextra -static -o App_screen_off App_restrict.c
+        ./android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O2 -Wall -Wextra -fPIE -pie -static -Wl,-z,tls-align=64 -o App_screen_off App_restrict.c
         
     - name: Upload Binary
       uses: actions/upload-artifact@v4
