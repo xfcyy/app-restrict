@@ -197,11 +197,11 @@ static bool get_foreground_package(char *out, size_t outsize) {
 
 /* 
  * 【第三版核心修改】：多源交叉验证屏幕状态
- * 1. /sys/class/graphics/fb0/blank (物理层，最权威)
- * 2. /sys/class/backlight/*/brightness (背光层，轻量)
- * 3. dumpsys display | grep mScreenState (系统显示层，解决唤醒延迟)
+ * 1. /sys/class/graphics/fb0/blank (物理层,最权威)
+ * 2. /sys/class/backlight/brightness (背光层,轻量)
+ * 3. dumpsys display | grep mScreenState (系统显示层,解决唤醒延迟)
  * 4. dumpsys power | grep mWakefulness (系统电源层)
- * 5. 终极兜底：返回 true (防烧屏底线)
+ * 5. 终极兜底:返回 true (防烧屏底线)
  */
 static bool get_screen_state(void) {
     bool on = true;
