@@ -101,6 +101,10 @@ static time_t last_cmd_fail_log = 0;
 static time_t last_backlight_fail_log = 0;
 static time_t last_perf_log_time = 0;
 
+/* v4: 应用切换检测缓冲计数器，防止dumpsys偶发失败导致误判切后台 */
+static int bg_mismatch_count = 0;
+#define BG_MISMATCH_THRESHOLD 2  /* 连续检测到非目标应用超过此值才重置 */
+
 /* ========== 时间工具函数 ========== */
 static inline time_t get_now(void) {
     struct timespec ts;
@@ -389,7 +393,11 @@ static long parse_time(const char* time_str) {
     if (*endptr == 'm') return value * 60;
     if (*endptr == 's') return value;
     if (*endptr != '\0') {
-        LOG_E("未知的超时时间后缀: %s，使用默认值", time_str);
+        LOG_E("未知的超时时间后缀: %s，使用默认值(按分钟解释)", time_str);
+    }
+    if (*endptr == '\0' && value > 0) {
+        /* v4: 无后缀时默认按分钟解释，打日志提示用户 */
+        LOG_I("注意: limit_time=%ld 未指定后缀(s/m/h)，按分钟解释为%lds", value, value * 60);
     }
     return value * 60;
 }
@@ -683,8 +691,13 @@ static int load_config(const char* config_path) {
                     }
                 }
             }
-        } else if (current_app && strcmp(key, "limit_time") == 0) {
-            current_app->limit_time = parse_time(value);
+        } else if (strcmp(key, "limit_time") == 0) {
+            if (!current_app) {
+                LOG_E("配置文件错误: limit_time 出现在 package 之前，已忽略");
+            } else {
+                current_app->limit_time = parse_time(value);
+                LOG_I("配置更新: limit_time=%ld", current_app->limit_time);
+            }
         } else if (strcmp(key, "cmd_timeout_ms") == 0) {
             long val = strtol(value, NULL, 10);
             if (val < 50) val = 50;
@@ -774,6 +787,11 @@ int main(int argc, char* argv[]) {
     LOG_I("启动应用时间限制守护进程（无触控息屏模式）");
     LOG_I("参数: cmd_timeout=%dms, front_cache=%ds, screen_check=%ds, poll_interval=%ds",
           cmd_timeout_ms, front_cache_sec, screen_check_sec, max_poll_interval);
+    /* v4: 打印每个应用的limit_time配置，便于用户确认配置生效 */
+    for (int i = 0; i < app_count; i++) {
+        LOG_I("应用配置: package=%s, limit_time=%lds(%d分钟)", 
+              apps[i].package, apps[i].limit_time, (int)(apps[i].limit_time / 60));
+    }
     
     init_touch_devices();
     time_t last_config_check = 0;
@@ -826,31 +844,52 @@ int main(int argc, char* argv[]) {
         time_t last_touch = now;
         has_touch = check_touch_input(&last_touch);
         
-        /* 前台应用检测 + 应用跟踪逻辑 */
-        if (get_top_app_name(current_app, sizeof(current_app))) {
-            for (int i = 0; i < app_count; i++) {
-                AppConfig* app = &apps[i];
-                if (strcmp(current_app, app->package) == 0) {
-                    if (app->start_time == 0) {
-                        app->start_time = now;
-                        app->last_touch_time = now;
-                        app->screen_off_triggered = false;
-                        LOG_I("开始跟踪 %s", app->package);
-                    } else {
-                        if (has_touch) {
-                            app->last_touch_time = now;
-                        }
-                        if (now - app->last_touch_time >= app->limit_time &&
-                            !app->screen_off_triggered) {
-                            trigger_screen_off(app);
-                        }
-                    }
+        /* 前台应用检测 + 应用跟踪逻辑(v4修复:空检测不重置+切换缓冲) */
+        get_top_app_name(current_app, sizeof(current_app));
+        
+        /* v4修复: 无法检测前台应用时(dumpsys繁忙/失败)，跳过本轮不重置状态 */
+        if (current_app[0] == '\0') {
+            bg_mismatch_count = 0;  /* 重置缓冲计数器 */
+            sleep(1);
+            continue;
+        }
+        
+        /* v4日志: 记录检测到的前台应用(便于调试) */
+        LOG_I("检测到前台应用: %s", current_app);
+        
+        for (int i = 0; i < app_count; i++) {
+            AppConfig* app = &apps[i];
+            if (strcmp(current_app, app->package) == 0) {
+                /* 匹配到目标应用 */
+                bg_mismatch_count = 0;  /* 重置缓冲计数器 */
+                if (app->start_time == 0) {
+                    app->start_time = now;
+                    app->last_touch_time = now;
+                    app->screen_off_triggered = false;
+                    LOG_I("开始跟踪 %s", app->package);
                 } else {
-                    if (app->start_time != 0) {
+                    if (has_touch) {
+                        app->last_touch_time = now;
+                    }
+                    if (now - app->last_touch_time >= app->limit_time &&
+                        !app->screen_off_triggered) {
+                        trigger_screen_off(app);
+                    }
+                }
+            } else {
+                /* v4修复: 使用缓冲计数器，防止偶发检测失败导致误重置 */
+                if (app->start_time != 0) {
+                    bg_mismatch_count++;
+                    if (bg_mismatch_count >= BG_MISMATCH_THRESHOLD) {
+                        /* 连续多次检测到非目标应用，确认真实切换后台 */
                         app->start_time = 0;
                         app->last_touch_time = 0;
                         app->screen_off_triggered = false;
+                        bg_mismatch_count = 0;
                         LOG_I("应用 %s 切换到后台，重置状态", app->package);
+                    } else {
+                        LOG_I("未检测到目标应用(第%d次/共%d次)，暂不重置", 
+                              bg_mismatch_count, BG_MISMATCH_THRESHOLD);
                     }
                 }
             }
