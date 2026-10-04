@@ -18,10 +18,6 @@
 #include <signal.h>
 #include <poll.h>
 #include <sys/wait.h>
-#include <sys/resource.h>
-#include <sys/inotify.h>
-#include <sys/prctl.h>
-#include <dlfcn.h>
 
 /* ========== 基础定义 ========== */
 #define MAX_PKG_LEN 256
@@ -45,15 +41,6 @@ static int screen_check_sec = 10;
 static int max_poll_interval = 10;
 /* final_check_window_s: 到期前权威查询窗口(秒)，默认3，范围1-10 */
 static int final_check_window_s = 3;
-
-/* ========== 激进优化: 自适应轮询参数 ========== */
-#define TOUCH_CHECK_INTERVAL_NORMAL 5
-#define TOUCH_CHECK_INTERVAL_IDLE 10
-#define TOUCH_CHECK_INTERVAL_DEEP_IDLE 15
-#define IDLE_THRESHOLD_SHORT 30
-#define IDLE_THRESHOLD_LONG 60
-#define CACHE_TTL_IDLE_MULTIPLIER 3
-#define CACHE_TTL_DEEP_IDLE_MULTIPLIER 5
 
 /* ========== 日志定义 ========== */
 #define LOG_I(fmt, ...) do { if (log_enabled) write_log("[I] " fmt, ##__VA_ARGS__); } while (0)
@@ -89,15 +76,6 @@ static time_t last_screen_check = 0;
 /* 触摸检测模式切换 */
 static bool use_getevent = false;
 
-/* 激进优化: inotify配置文件监控 */
-static int inotify_fd = -1;
-static int inotify_watch_fd = -1;
-static char config_path_buf[512] = {0};
-
-/* 激进优化: 自适应空闲检测 */
-static time_t last_global_touch_time = 0;
-static int adaptive_mode = 0; /* 0=normal, 1=idle, 2=deep_idle */
-
 /* 性能埋点统计 */
 static int cmd_exec_count = 0;
 static int cmd_timeout_count = 0;
@@ -122,10 +100,6 @@ static time_t last_no_touch_log = 0;
 static time_t last_cmd_fail_log = 0;
 static time_t last_backlight_fail_log = 0;
 static time_t last_perf_log_time = 0;
-
-/* 激进优化: 日志缓冲计数 */
-static int log_flush_counter = 0;
-#define LOG_FLUSH_INTERVAL 10
 
 /* ========== 时间工具函数 ========== */
 static inline time_t get_now(void) {
@@ -162,7 +136,6 @@ static void check_log_size(void) {
     }
 }
 
-/* 激进优化: 日志写入使用缓冲策略，减少磁盘I/O */
 static void write_log(const char* fmt, ...) {
     ensure_log_file();
     if (!log_fp) return;
@@ -177,34 +150,9 @@ static void write_log(const char* fmt, ...) {
     fprintf(log_fp, "[%s] ", get_timestamp());
     vfprintf(log_fp, fmt, args);
     fprintf(log_fp, "\n");
-    /* 错误日志立即flush + 定期强制flush确保落盘 */
-    if (fmt[1] == 'E') {
-        fflush(log_fp);
-    } else {
-        log_flush_counter++;
-        if (log_flush_counter >= LOG_FLUSH_INTERVAL) {
-            fflush(log_fp);
-            log_flush_counter = 0;
-        }
-    }
     fflush(log_fp);
     va_end(args);
     log_writing = false;
-}
-
-/* 激进优化: 设置日志文件为行缓冲模式 */
-static void optimize_log_buffering(void) {
-    if (log_fp) {
-        char log_buf[4096];
-        setvbuf(log_fp, log_buf, _IOLBF, sizeof(log_buf));
-    }
-}
-
-/* 修复: 注册退出处理器，确保程序退出时日志强制刷新落盘 */
-static void log_flush_on_exit(void) {
-    if (log_fp) {
-        fflush(log_fp);
-    }
 }
 
 /* ========== 性能埋点: 打印周期性能统计 ========== */
@@ -220,6 +168,7 @@ static void log_perf_stats(time_t now) {
               cmd_exec_count > 0 ? cmd_slow_count * 100 / cmd_exec_count : 0,
               avg_ms);
     }
+    /* 重置计数器 */
     cmd_exec_count = 0;
     cmd_timeout_count = 0;
     cmd_slow_count = 0;
@@ -255,6 +204,7 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
 
     pid_t pid = fork();
     if (pid == 0) {
+        /* 子进程: 重定向stdout到管道写端 */
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
@@ -262,18 +212,21 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
         _exit(127);
     }
 
+    /* 父进程: 关闭管道写端 */
     close(pipefd[1]);
 
+    /* 设置读取端为非阻塞 */
     int flags = fcntl(pipefd[0], F_GETFL, 0);
     fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
 
+    /* 使用poll等待数据，带可配超时 */
     struct pollfd pfd;
     pfd.fd = pipefd[0];
     pfd.events = POLLIN;
-    /* 使用可配置的超时时间 */
     int poll_ret = poll(&pfd, 1, cmd_timeout_ms);
 
     if (poll_ret == 0) {
+        /* 超时 - 强制终止子进程 */
         kill(pid, SIGKILL);
         close(pipefd[0]);
         int status;
@@ -303,16 +256,19 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
         return -1;
     }
 
-    /* Fix1: 使用fread返回值精确控制读取长度 */
+    /* Fix1: 使用fread返回值精确控制读取长度，不再使用strlen */
     size_t total_size = 0;
     if (buf) buf[0] = '\0';
     char read_buf[256];
+
     while (1) {
         pfd.revents = 0;
-        int poll_ret2 = poll(&pfd, 1, 100);
+        int poll_ret2 = poll(&pfd, 1, 100); /* 每次读最多等100ms */
         if (poll_ret2 <= 0) break;
+
         ssize_t n = read(pipefd[0], read_buf, sizeof(read_buf));
         if (n <= 0) break;
+
         if (buf && total_size < buf_size - 1) {
             size_t space = buf_size - total_size - 1;
             if ((size_t)n > space) n = space;
@@ -320,8 +276,10 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
             total_size += n;
         }
     }
+
     if (buf) buf[total_size] = '\0';
     close(pipefd[0]);
+
     int status;
     waitpid(pid, &status, 0);
     
@@ -337,44 +295,15 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
     return total_size > 0 || !buf ? 0 : -1;
 }
 
-/* ========== 激进优化: 自适应缓存TTL ========== */
-static inline int get_top_pkg_cache_ttl(void) {
-    if (adaptive_mode == 0) return front_cache_sec;
-    if (adaptive_mode == 1) return front_cache_sec * CACHE_TTL_IDLE_MULTIPLIER;
-    return front_cache_sec * CACHE_TTL_DEEP_IDLE_MULTIPLIER;
-}
-
-static inline int get_screen_check_interval(void) {
-    if (adaptive_mode == 0) return screen_check_sec;
-    if (adaptive_mode == 1) return screen_check_sec * CACHE_TTL_IDLE_MULTIPLIER;
-    return screen_check_sec * CACHE_TTL_DEEP_IDLE_MULTIPLIER;
-}
-
-/* 激进优化: 更新自适应模式状态 */
-static void update_adaptive_mode(time_t now) {
-    time_t idle_time = now - last_global_touch_time;
-    int new_mode = 0;
-    if (idle_time >= IDLE_THRESHOLD_LONG) {
-        new_mode = 2;
-    } else if (idle_time >= IDLE_THRESHOLD_SHORT) {
-        new_mode = 1;
-    }
-    if (new_mode != adaptive_mode) {
-        const char* mode_names[] = {"正常", "空闲", "深度空闲"};
-        LOG_I("自适应轮询模式切换: %s -> %s", mode_names[adaptive_mode], mode_names[new_mode]);
-        adaptive_mode = new_mode;
-    }
-}
-
-/* ========== get_top_app_name(使用可配置自适应缓存TTL) ========== */
+/* ========== get_top_app_name(使用可配置缓存TTL) ========== */
 static char* get_top_app_name(char* buf, size_t buf_size) {
     if (!buf || buf_size < MAX_PKG_LEN) {
         LOG_E("无效缓冲区或大小");
         return NULL;
     }
     time_t current_time = get_now();
-    /* 使用自适应缓存TTL */
-    if (current_time - last_top_pkg_time < get_top_pkg_cache_ttl() && cached_top_pkg[0]) {
+    /* 使用可配置的前台应用缓存TTL */
+    if (current_time - last_top_pkg_time < front_cache_sec && cached_top_pkg[0]) {
         snprintf(buf, buf_size, "%s", cached_top_pkg);
         return buf;
     }
@@ -543,6 +472,8 @@ static bool init_getevent(void) {
     getevent_fd = fileno(getevent_pipe);
     int flags = fcntl(getevent_fd, F_GETFL, 0);
     fcntl(getevent_fd, F_SETFL, flags | O_NONBLOCK);
+
+    /* Fix4: 如果epfd无效(-1)，重新创建epoll实例 */
     if (epfd < 0) {
         epfd = epoll_create1(0);
         if (epfd < 0) {
@@ -553,6 +484,7 @@ static bool init_getevent(void) {
             return false;
         }
     }
+
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = getevent_fd;
@@ -583,14 +515,7 @@ static void cleanup_touch_devices(void) {
     }
 }
 
-/* ========== 激进优化: 自适应epoll超时 ========== */
-static inline int get_adaptive_epoll_timeout(void) {
-    if (adaptive_mode == 0) return TOUCH_CHECK_INTERVAL_NORMAL * 1000;
-    if (adaptive_mode == 1) return TOUCH_CHECK_INTERVAL_IDLE * 1000;
-    return TOUCH_CHECK_INTERVAL_DEEP_IDLE * 1000;
-}
-
-/* ========== check_touch_input(自适应超时 + 更新全局触摸时间) ========== */
+/* ========== check_touch_input(使用可配置超时) ========== */
 static bool check_touch_input(time_t* last_touch) {
     if (touch_fd_count == 0 && !use_getevent && !init_touch_devices()) {
         use_getevent = true;
@@ -599,10 +524,8 @@ static bool check_touch_input(time_t* last_touch) {
         return false;
     }
     struct epoll_event events[MAX_DEVICES + 1];
-    /* 使用自适应超时，但不超过max_poll_interval上限 */
-    int adaptive_timeout = get_adaptive_epoll_timeout();
-    int max_timeout = max_poll_interval * 1000;
-    int timeout = (adaptive_timeout > max_timeout) ? max_timeout : adaptive_timeout;
+    /* 使用可配置的最大轮询间隔，但不超过max_poll_interval */
+    int timeout = max_poll_interval * 1000;
     int nfds = epoll_wait(epfd, events, MAX_DEVICES + 1, timeout);
     if (nfds < 0) {
         if (errno == EINTR) return false;
@@ -654,8 +577,6 @@ static bool check_touch_input(time_t* last_touch) {
         }
         if (touch_detected) {
             *last_touch = get_now();
-            last_global_touch_time = *last_touch;
-            if (log_fp) fflush(log_fp);
             return true;
         }
     }
@@ -666,9 +587,7 @@ static bool check_touch_input(time_t* last_touch) {
 /* 优化: 不再调用任何dumpsys命令，纯文件读取，零fork零阻塞 */
 static bool is_screen_on(void) {
     time_t now = get_now();
-    /* 使用自适应缓存间隔 */
-    int screen_check_interval = get_screen_check_interval();
-    if (now - last_screen_check < screen_check_interval && last_screen_check != 0) {
+    if (now - last_screen_check < screen_check_sec && last_screen_check != 0) {
         return screen_state_cached;
     }
     
@@ -681,14 +600,17 @@ static bool is_screen_on(void) {
         close(fd);
         if (n > 0) {
             long value = strtol(buf, NULL, 10);
+            /* 亮度>0 => 屏幕开着; 亮度=0 => 屏幕关了 */
             screen_state_cached = (value > 0);
             last_screen_check = now;
             return screen_state_cached;
         }
+        /* 读取失败(文件不存在/无权限)，保守返回true */
         screen_state_cached = true;
         last_screen_check = now;
         return true;
     }
+    /* 文件不可打开(路径不存在)，保守返回true */
     screen_state_cached = true;
     last_screen_check = now;
     return true;
@@ -716,107 +638,8 @@ static void trigger_screen_off(AppConfig* app) {
     LOG_E("无法触发屏幕息屏，请检查设备权限或背光文件路径");
 }
 
-/* ========== 激进优化: inotify配置文件监控 ========== */
-static bool init_config_inotify(const char* config_path) {
-    strncpy(config_path_buf, config_path, sizeof(config_path_buf) - 1);
-    config_path_buf[sizeof(config_path_buf) - 1] = '\0';
-
-    inotify_fd = inotify_init();
-    if (inotify_fd < 0) {
-        LOG_E("inotify_init失败: %s，回退到stat轮询", strerror(errno));
-        return false;
-    }
-
-    inotify_watch_fd = inotify_add_watch(inotify_fd, config_path_buf, IN_MODIFY | IN_CLOSE_WRITE);
-    if (inotify_watch_fd < 0) {
-        LOG_E("inotify_add_watch失败: %s，回退到stat轮询", strerror(errno));
-        close(inotify_fd);
-        inotify_fd = -1;
-        return false;
-    }
-
-    LOG_I("配置文件inotify监控已启动: %s", config_path_buf);
-    return true;
-}
-
-static bool check_config_inotify_event(void) {
-    if (inotify_fd < 0) return false;
-
-    char inotify_buf[512];
-    ssize_t n = read(inotify_fd, inotify_buf, sizeof(inotify_buf));
-    if (n > 0) {
-        struct inotify_event* event = (struct inotify_event*)inotify_buf;
-        if (event->mask & (IN_MODIFY | IN_CLOSE_WRITE)) {
-            LOG_I("检测到配置文件变更，正在重载...");
-            /* 加载新配置（复用load_config_internal） */
-            FILE* fp = fopen(config_path_buf, "r");
-            if (fp) {
-                AppConfig temp_apps[MAX_APPS];
-                int temp_app_count = 0;
-                AppConfig* current_app = NULL;
-                char line[CONFIG_LINE_MAX];
-                while (fgets(line, sizeof(line), fp)) {
-                    char* trimmed = line;
-                    while (isspace(*trimmed)) trimmed++;
-                    if (*trimmed == '\0' || *trimmed == '#') continue;
-                    char* key = strtok(trimmed, "=");
-                    char* value = strtok(NULL, "\n");
-                    if (!key || !value) continue;
-                    while (isspace(*key)) key++;
-                    char* key_end = key + strlen(key) - 1;
-                    while (key_end > key && isspace(*key_end)) {
-                        *key_end = '\0';
-                        key_end--;
-                    }
-                    while (isspace(*value)) value++;
-                    if (strcmp(key, "package") == 0) {
-                        if (temp_app_count < MAX_APPS) {
-                            current_app = &temp_apps[temp_app_count++];
-                            strncpy(current_app->package, value, MAX_PKG_LEN - 1);
-                            current_app->package[MAX_PKG_LEN - 1] = '\0';
-                            current_app->limit_time = 15 * 60;
-                            current_app->start_time = 0;
-                            current_app->last_touch_time = 0;
-                            current_app->screen_off_triggered = false;
-                            for (int i = 0; i < app_count; i++) {
-                                if (strcmp(apps[i].package, current_app->package) == 0) {
-                                    current_app->start_time = apps[i].start_time;
-                                    current_app->last_touch_time = apps[i].last_touch_time;
-                                    current_app->screen_off_triggered = apps[i].screen_off_triggered;
-                                    break;
-                                }
-                            }
-                        }
-                    } else if (current_app && strcmp(key, "limit_time") == 0) {
-                        current_app->limit_time = parse_time(value);
-                    }
-                }
-                fclose(fp);
-                memcpy(apps, temp_apps, sizeof(AppConfig) * temp_app_count);
-                app_count = temp_app_count;
-                LOG_I("配置文件重载完成，监控 %d 个应用", app_count);
-            } else {
-                LOG_E("重载配置文件失败: %s", strerror(errno));
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
-static void cleanup_config_inotify(void) {
-    if (inotify_fd >= 0) {
-        if (inotify_watch_fd >= 0) {
-            inotify_rm_watch(inotify_fd, inotify_watch_fd);
-            inotify_watch_fd = -1;
-        }
-        close(inotify_fd);
-        inotify_fd = -1;
-    }
-}
-
-/* ========== 配置加载函数(扩展支持新参数) ========== */
-static int load_config_internal(const char* config_path) {
+/* ========== 配置文件加载(扩展支持新参数) ========== */
+static int load_config(const char* config_path) {
     FILE* fp = fopen(config_path, "r");
     if (!fp) {
         LOG_E("无法打开配置文件: %s", config_path);
@@ -834,12 +657,14 @@ static int load_config_internal(const char* config_path) {
         char* value = strtok(NULL, "\n");
         if (!key || !value) continue;
         while (isspace(*key)) key++;
+        /* Fix6: 去掉key尾部的空格 */
         char* key_end = key + strlen(key) - 1;
         while (key_end > key && isspace(*key_end)) {
             *key_end = '\0';
             key_end--;
         }
         while (isspace(*value)) value++;
+        
         if (strcmp(key, "package") == 0) {
             if (temp_app_count < MAX_APPS) {
                 current_app = &temp_apps[temp_app_count++];
@@ -898,31 +723,17 @@ static int load_config_internal(const char* config_path) {
     return 0;
 }
 
-static int load_config(const char* config_path) {
-    return load_config_internal(config_path);
-}
-
-/* ========== 激进优化: 设置进程优先级和I/O优先级 ========== */
-static void set_process_priority(void) {
-    if (setpriority(PRIO_PROCESS, 0, 19) < 0) {
-        LOG_E("setpriority失败: %s", strerror(errno));
-    } else {
-        LOG_I("CPU优先级已设置为最低(nice=19)");
+static bool check_config_updated(const char* config_path) {
+    struct stat st;
+    if (stat(config_path, &st) != 0) {
+        LOG_E("无法获取配置文件状态: %s", config_path);
+        return false;
     }
-    {
-        void* handle = dlopen("libc.so", RTLD_LAZY);
-        if (handle) {
-            typedef int (*ionice_fn)(int, int, int);
-            ionice_fn ionice_fn_ptr = (ionice_fn)dlsym(handle, "ionice");
-            if (ionice_fn_ptr) {
-                if (ionice_fn_ptr(3, 0, 3) == 0) {
-                    LOG_I("I/O优先级已设置为idle类");
-                }
-            }
-            dlclose(handle);
-        }
+    if (st.st_mtime > last_config_mtime) {
+        last_config_mtime = st.st_mtime;
+        return true;
     }
-    prctl(PR_SET_NAME, "app_restrict", 0, 0, 0);
+    return false;
 }
 
 /* ========== main函数 ========== */
@@ -949,7 +760,6 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "无法打开日志文件: %s\n", log_file_path);
             return 1;
         }
-        optimize_log_buffering();
     }
     if (load_config(config_path) != 0) {
         if (log_fp) fclose(log_fp);
@@ -961,17 +771,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    LOG_I("启动应用时间限制守护进程（无触控息屏模式·激进优化版）");
+    LOG_I("启动应用时间限制守护进程（无触控息屏模式）");
     LOG_I("参数: cmd_timeout=%dms, front_cache=%ds, screen_check=%ds, poll_interval=%ds",
           cmd_timeout_ms, front_cache_sec, screen_check_sec, max_poll_interval);
     
-    set_process_priority();
-    atexit(log_flush_on_exit);
-    
-    bool inotify_enabled = init_config_inotify(config_path);
     init_touch_devices();
-    last_global_touch_time = get_now();
-    
     time_t last_config_check = 0;
     char current_app[MAX_PKG_LEN];
     bool last_logged_screen_state = true;
@@ -982,10 +786,7 @@ int main(int argc, char* argv[]) {
         /* 定期打印性能统计 */
         log_perf_stats(now);
         
-        /* 更新自适应模式状态 */
-        update_adaptive_mode(now);
-        
-        /* 屏幕状态检测（纯sysfs，零fork） */
+        /* 屏幕状态检测（使用纯sysfs，零fork） */
         bool screen_on = is_screen_on();
         if (screen_on != last_logged_screen_state) {
             LOG_I("屏幕状态变为: %s", screen_on ? "开启" : "关闭");
@@ -1007,79 +808,55 @@ int main(int argc, char* argv[]) {
             continue;
         }
         
-        /* inotify检测配置变更 */
-        if (inotify_enabled) {
-            if (check_config_inotify_event()) {
-                continue;
+        /* 配置文件热重载检测 */
+        if (now - last_config_check >= 10) {
+            if (check_config_updated(config_path)) {
+                load_config(config_path);
             }
-        } else {
-            if (now - last_config_check >= 10) {
-                struct stat st;
-                if (stat(config_path, &st) == 0 && st.st_mtime > last_config_mtime) {
-                    last_config_mtime = st.st_mtime;
-                    load_config(config_path);
-                    LOG_I("配置文件已更新，重新加载");
-                }
-                last_config_check = now;
-            }
+            last_config_check = now;
         }
         
-        /* 触摸设备初始化 */
+        /* 触摸设备初始化（仅在需要时） */
         if (touch_fd_count == 0 && !use_getevent) {
             init_touch_devices();
         }
         
-        /* 触摸检测（自适应超时） */
+        /* 触摸检测（使用可配置超时） */
         bool has_touch = false;
         time_t last_touch = now;
         has_touch = check_touch_input(&last_touch);
         
-        /* 激进优化: 空闲模式下跳过昂贵的前台应用检测 */
-        if (adaptive_mode == 0 || has_touch || app_count == 0) {
-            if (get_top_app_name(current_app, sizeof(current_app))) {
-                for (int i = 0; i < app_count; i++) {
-                    AppConfig* app = &apps[i];
-                    if (strcmp(current_app, app->package) == 0) {
-                        if (app->start_time == 0) {
-                            app->start_time = now;
-                            app->last_touch_time = now;
-                            app->screen_off_triggered = false;
-                            LOG_I("开始跟踪 %s", app->package);
-                        } else {
-                            if (has_touch) {
-                                app->last_touch_time = now;
-                            }
-                            if (now - app->last_touch_time >= app->limit_time &&
-                                !app->screen_off_triggered) {
-                                trigger_screen_off(app);
-                            }
-                        }
+        /* 前台应用检测 + 应用跟踪逻辑 */
+        if (get_top_app_name(current_app, sizeof(current_app))) {
+            for (int i = 0; i < app_count; i++) {
+                AppConfig* app = &apps[i];
+                if (strcmp(current_app, app->package) == 0) {
+                    if (app->start_time == 0) {
+                        app->start_time = now;
+                        app->last_touch_time = now;
+                        app->screen_off_triggered = false;
+                        LOG_I("开始跟踪 %s", app->package);
                     } else {
-                        if (app->start_time != 0) {
-                            app->start_time = 0;
-                            app->last_touch_time = 0;
-                            app->screen_off_triggered = false;
-                            LOG_I("应用 %s 切换到后台，重置状态", app->package);
+                        if (has_touch) {
+                            app->last_touch_time = now;
                         }
-                    }
-                }
-            }
-        } else {
-            if (cached_top_pkg[0] && get_top_app_name(current_app, sizeof(current_app)) != NULL) {
-                for (int i = 0; i < app_count; i++) {
-                    AppConfig* app = &apps[i];
-                    if (strcmp(current_app, app->package) == 0 && app->start_time != 0) {
                         if (now - app->last_touch_time >= app->limit_time &&
                             !app->screen_off_triggered) {
                             trigger_screen_off(app);
                         }
+                    }
+                } else {
+                    if (app->start_time != 0) {
+                        app->start_time = 0;
+                        app->last_touch_time = 0;
+                        app->screen_off_triggered = false;
+                        LOG_I("应用 %s 切换到后台，重置状态", app->package);
                     }
                 }
             }
         }
     }
     
-    cleanup_config_inotify();
     cleanup_touch_devices();
     if (log_fp) fclose(log_fp);
     return 0;
