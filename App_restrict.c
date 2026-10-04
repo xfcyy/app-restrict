@@ -21,7 +21,7 @@
 #include <linux/limits.h>
 
 /* ===== 日志 ===== */
-#define LOG_FILE "/data/adb/modules/App_screen_off_Aloazny/app_screen_off.log"
+#define LOG_FILE "/data/adb/modules/App_screen_off_Aloazny/App_screen_off.log"
 #define MAX_LOG_SIZE (100 * 1024)
 
 #define LOG_I(fmt, ...) do_log("I", fmt, ##__VA_ARGS__)
@@ -407,7 +407,7 @@ int main(void) {
     LOG_I("  App_screen_off 守护进程启动");
     LOG_I("========================================");
 
-    const char *config_path = "/data/adb/modules/App_screen_off/config.prop";
+    const char *config_path = "/data/adb/modules/App_screen_off_Aloazny/config.prop";
     load_config(config_path);
 
     if (app_count == 0) {
