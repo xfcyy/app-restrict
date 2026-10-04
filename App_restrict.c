@@ -165,7 +165,7 @@ static void write_log(const char* fmt, ...) {
     fprintf(log_fp, "\n");
     /* 激进优化: 不每次都fflush，减少磁盘I/O
      * 改为: 日志级别为E时立即flush，否则计数器达到阈值时flush */
-    if (fmt[2] == 'E') {
+    if (fmt[1] == 'E') {
         fflush(log_fp);  /* 错误日志立即落盘 */
     } else {
         log_flush_counter++;
