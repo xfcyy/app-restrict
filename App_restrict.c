@@ -41,10 +41,13 @@ static int screen_check_sec = 10;
 static int max_poll_interval = 10;
 /* final_check_window_s: 到期前权威查询窗口(秒)，默认3，范围1-10 */
 static int final_check_window_s = 3;
+/* count_syn_report_as_touch: 诊断开关，1=SYN_REPORT算触摸(复现bug)，0=不算(修复后验证)，默认1 */
+static int count_syn_report_as_touch = 1;
 
 /* ========== 日志定义 ========== */
 #define LOG_I(fmt, ...) do { if (log_enabled) write_log("[I] " fmt, ##__VA_ARGS__); } while (0)
 #define LOG_E(fmt, ...) do { if (log_enabled) write_log("[E] " fmt, ##__VA_ARGS__); } while (0)
+#define LOG_DIAG(fmt, ...) do { write_log("[DIAG] " fmt, ##__VA_ARGS__); } while (0)
 
 /* ========== epoll/bitops宏 ========== */
 #ifndef BITS_PER_LONG
@@ -81,14 +84,27 @@ static int cmd_exec_count = 0;
 static int cmd_timeout_count = 0;
 static int cmd_slow_count = 0;
 static long total_cmd_elapsed_ms = 0;
+/* ========== 诊断埋点变量 ========== */
+static int diag_event_log_count = 0;  /* 诊断原始事件日志计数器，硬限200行 */
+#define DIAG_EVENT_LOG_MAX 200
+static time_t last_diag_summary_time = 0;  /* 诊断汇总统计上次打印时间 */
+static int diag_syn_report_count = 0;  /* 本周期SYN_REPORT计数 */
+static int diag_abs_mt_count = 0;  /* 本周期ABS_MT_*计数 */
+static int diag_btn_touch_count = 0;  /* 本周期BTN_TOUCH计数 */
+static int diag_other_count = 0;  /* 本周期其他事件计数 */
+static int diag_touch_judged_count = 0;  /* 本周期判定为触摸的次数 */
+static int idle_spurious_count = 0;  /* 空闲期误触发触摸计数 */
+static time_t last_real_touch_time = 0;  /* 上次真实触摸时间 */
 
-/* ========== AppConfig定义 ========== */
+
+/* ========== AppConfig定义(v6: bg_mismatch_count移入结构体，每应用独立) ========== */
 typedef struct {
     char package[MAX_PKG_LEN];
     long limit_time;
     time_t start_time;
     time_t last_touch_time;
     bool screen_off_triggered;
+    int bg_mismatch_count;  /* v6: 每应用独立的切换检测缓冲 */
 } AppConfig;
 
 static AppConfig apps[MAX_APPS];
@@ -101,9 +117,8 @@ static time_t last_cmd_fail_log = 0;
 static time_t last_backlight_fail_log = 0;
 static time_t last_perf_log_time = 0;
 
-/* v4: 应用切换检测缓冲计数器，防止dumpsys偶发失败导致误判切后台 */
-static int bg_mismatch_count = 0;
-#define BG_MISMATCH_THRESHOLD 2  /* 连续检测到非目标应用超过此值才重置 */
+/* v6: 每应用独立的切换缓冲阈值，提高到5次增加容错 */
+#define BG_MISMATCH_THRESHOLD 5
 
 /* ========== 时间工具函数 ========== */
 static inline time_t get_now(void) {
@@ -180,8 +195,6 @@ static void log_perf_stats(time_t now) {
 }
 
 /* ========== exec_cmd(含性能埋点 + 可配超时) ========== */
-/* Fix1: 修复fread循环中用strlen计算读取长度的缓冲区越界读取bug */
-/* Fix2: 添加超时机制，防止dumpsys永久挂起导致程序永久阻塞 */
 static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
     struct timespec start_ts, end_ts;
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
@@ -208,7 +221,6 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
 
     pid_t pid = fork();
     if (pid == 0) {
-        /* 子进程: 重定向stdout到管道写端 */
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
@@ -216,21 +228,17 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
         _exit(127);
     }
 
-    /* 父进程: 关闭管道写端 */
     close(pipefd[1]);
 
-    /* 设置读取端为非阻塞 */
     int flags = fcntl(pipefd[0], F_GETFL, 0);
     fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
 
-    /* 使用poll等待数据，带可配超时 */
     struct pollfd pfd;
     pfd.fd = pipefd[0];
     pfd.events = POLLIN;
     int poll_ret = poll(&pfd, 1, cmd_timeout_ms);
 
     if (poll_ret == 0) {
-        /* 超时 - 强制终止子进程 */
         kill(pid, SIGKILL);
         close(pipefd[0]);
         int status;
@@ -260,14 +268,13 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
         return -1;
     }
 
-    /* Fix1: 使用fread返回值精确控制读取长度，不再使用strlen */
     size_t total_size = 0;
     if (buf) buf[0] = '\0';
     char read_buf[256];
 
     while (1) {
         pfd.revents = 0;
-        int poll_ret2 = poll(&pfd, 1, 100); /* 每次读最多等100ms */
+        int poll_ret2 = poll(&pfd, 1, 100);
         if (poll_ret2 <= 0) break;
 
         ssize_t n = read(pipefd[0], read_buf, sizeof(read_buf));
@@ -306,7 +313,6 @@ static char* get_top_app_name(char* buf, size_t buf_size) {
         return NULL;
     }
     time_t current_time = get_now();
-    /* 使用可配置的前台应用缓存TTL */
     if (current_time - last_top_pkg_time < front_cache_sec && cached_top_pkg[0]) {
         snprintf(buf, buf_size, "%s", cached_top_pkg);
         return buf;
@@ -396,10 +402,18 @@ static long parse_time(const char* time_str) {
         LOG_E("未知的超时时间后缀: %s，使用默认值(按分钟解释)", time_str);
     }
     if (*endptr == '\0' && value > 0) {
-        /* v4: 无后缀时默认按分钟解释，打日志提示用户 */
         LOG_I("注意: limit_time=%ld 未指定后缀(s/m/h)，按分钟解释为%lds", value, value * 60);
     }
     return value * 60;
+}
+
+/* ========== v6: 去除字符串尾部空白字符(\r\n\t空格) ========== */
+static void strip_trailing_whitespace(char* str) {
+    char* end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
+    }
 }
 
 /* ========== 触摸设备检测 ========== */
@@ -467,7 +481,6 @@ static bool init_touch_devices(void) {
     return true;
 }
 
-/* Fix4: init_getevent增加epfd有效性检查 */
 static bool init_getevent(void) {
     if (getevent_fd >= 0) return true;
     if (!getevent_pipe) {
@@ -481,7 +494,6 @@ static bool init_getevent(void) {
     int flags = fcntl(getevent_fd, F_GETFL, 0);
     fcntl(getevent_fd, F_SETFL, flags | O_NONBLOCK);
 
-    /* Fix4: 如果epfd无效(-1)，重新创建epoll实例 */
     if (epfd < 0) {
         epfd = epoll_create1(0);
         if (epfd < 0) {
@@ -523,7 +535,11 @@ static void cleanup_touch_devices(void) {
     }
 }
 
-/* ========== check_touch_input(使用可配置超时) ========== */
+/* ========== check_touch_input(v6修复: 设备模式下SYN_REPORT不再单独触发触摸) ========== */
+/* v6核心修复: SYN_REPORT是事件包同步标记，不是触摸动作本身。
+ * 某些驱动在无触摸时也会周期性发送SYN_REPORT，导致last_touch_time被误更新，
+ * 息屏计时器永远无法到期。v6改为：仅当SYN_REPORT伴随实际触摸数据(ABS_MT_POSITION_X等或BTN_TOUCH)时才计数。
+ * 纯SYN_REPORT不再单独触发触摸标记。 */
 static bool check_touch_input(time_t* last_touch) {
     if (touch_fd_count == 0 && !use_getevent && !init_touch_devices()) {
         use_getevent = true;
@@ -532,7 +548,6 @@ static bool check_touch_input(time_t* last_touch) {
         return false;
     }
     struct epoll_event events[MAX_DEVICES + 1];
-    /* 使用可配置的最大轮询间隔，但不超过max_poll_interval */
     int timeout = max_poll_interval * 1000;
     int nfds = epoll_wait(epfd, events, MAX_DEVICES + 1, timeout);
     if (nfds < 0) {
@@ -543,21 +558,57 @@ static bool check_touch_input(time_t* last_touch) {
     }
     if (nfds > 0) {
         bool touch_detected = false;
+        bool has_touch_data_this_frame = false;  /* v6: 跟踪本帧是否有真实触摸数据 */
+        
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
             if (!use_getevent && fd != getevent_fd) {
                 struct input_event ev;
                 while (read(fd, &ev, sizeof(ev)) > 0) {
+                    /* 诊断: 记录事件类型用于统计 */
+                    if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                        diag_syn_report_count++;
+                    } else if (ev.type == EV_ABS && (
+                        ev.code == ABS_MT_POSITION_X ||
+                        ev.code == ABS_MT_POSITION_Y ||
+                        ev.code == ABS_MT_TRACKING_ID ||
+                        ev.code == ABS_MT_PRESSURE)) {
+                        diag_abs_mt_count++;
+                    } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+                        diag_btn_touch_count++;
+                    } else {
+                        diag_other_count++;
+                    }
+                    /* 诊断: 打印原始事件(硬限200行) */
+                    if (diag_event_log_count < DIAG_EVENT_LOG_MAX) {
+                        const char* type_str = "UNKNOWN";
+                        if (ev.type == EV_KEY) type_str = "EV_KEY";
+                        else if (ev.type == EV_ABS) type_str = "EV_ABS";
+                        else if (ev.type == EV_SYN) type_str = "EV_SYN";
+                        else if (ev.type == EV_REL) type_str = "EV_REL";
+                        LOG_DIAG("ev type=%d(%s) code=%d value=%d", ev.type, type_str, ev.code, ev.value);
+                        diag_event_log_count++;
+                    }
                     if (ev.type == EV_ABS && (
                         ev.code == ABS_MT_POSITION_X ||
                         ev.code == ABS_MT_POSITION_Y ||
                         ev.code == ABS_MT_TRACKING_ID ||
                         ev.code == ABS_MT_PRESSURE)) {
+                        has_touch_data_this_frame = true;
                         touch_detected = true;
                     } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 1) {
+                        has_touch_data_this_frame = true;
                         touch_detected = true;
                     } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-                        touch_detected = true;
+                        /* v6修复: SYN_REPORT本身不是触摸，只有伴随真实触摸数据时才计数 */
+                        if (has_touch_data_this_frame) {
+                            touch_detected = true;
+                        }
+                        /* 诊断: SYN_REPORT单独出现时记录原因 */
+                        if (!has_touch_data_this_frame && count_syn_report_as_touch) {
+                            touch_detected = true;
+                            LOG_DIAG("last_touch_time 更新 <- SYN_REPORT(空闲期误触发!)");
+                        }
                     }
                 }
                 if (errno != EAGAIN) {
@@ -566,15 +617,35 @@ static bool check_touch_input(time_t* last_touch) {
                     return false;
                 }
             } else if (fd == getevent_fd) {
-                static char buf[256];
+                /* v5/v6: 正确解析getevent输出，只识别真正的触摸事件 */
+                static char buf[2048];
                 static size_t buf_pos = 0;
                 ssize_t n;
                 while ((n = read(fd, buf + buf_pos, sizeof(buf) - buf_pos - 1)) > 0) {
                     buf_pos += n;
                     buf[buf_pos] = '\0';
-                    if (buf_pos > 0) {
-                        touch_detected = true;
-                        break;
+                    
+                    char* line_start = buf;
+                    char* line_end;
+                    while ((line_end = strchr(line_start, '\n')) != NULL) {
+                        *line_end = '\0';
+                        
+                        if (strstr(line_start, "ABS_MT_POSITION_X") ||
+                            strstr(line_start, "ABS_MT_POSITION_Y") ||
+                            strstr(line_start, "ABS_MT_TRACKING_ID") ||
+                            strstr(line_start, "ABS_MT_PRESSURE") ||
+                            strstr(line_start, "BTN_TOUCH")) {
+                            touch_detected = true;
+                        }
+                        
+                        line_start = line_end + 1;
+                    }
+                    if (*line_start != '\0') {
+                        size_t remaining = strlen(line_start);
+                        memmove(buf, line_start, remaining + 1);
+                        buf_pos = remaining;
+                    } else {
+                        buf_pos = 0;
                     }
                 }
                 if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -584,22 +655,46 @@ static bool check_touch_input(time_t* last_touch) {
             }
         }
         if (touch_detected) {
+            diag_touch_judged_count++;
             *last_touch = get_now();
+            /* 诊断: 记录last_touch_time更新原因 */
+            if (diag_event_log_count >= DIAG_EVENT_LOG_MAX && get_now() - last_real_touch_time > 2) {
+                idle_spurious_count++;
+                if (idle_spurious_count % 10 == 1) {
+                    LOG_DIAG("last_touch_time 更新 <- 事件判定(空闲期误触发! idle_spurious=%d)", idle_spurious_count);
+                }
+            }
+            last_real_touch_time = *last_touch;
             return true;
         }
+    }
+    /* 诊断: 周期性打印事件统计汇总 */
+    if (get_now() - last_diag_summary_time >= 1) {
+        last_diag_summary_time = get_now();
+        LOG_DIAG("[DIAG统计] 本秒事件总数=%d | SYN_REPORT=%d | ABS_MT_POSITION_X/Y=%d | BTN_TOUCH=%d | 其他=%d | 判定触摸=%d",
+                 diag_syn_report_count + diag_abs_mt_count + diag_btn_touch_count + diag_other_count,
+                 diag_syn_report_count, diag_abs_mt_count, diag_btn_touch_count, diag_other_count,
+                 diag_touch_judged_count);
+        if (idle_spurious_count > 0) {
+            LOG_DIAG("[DIAG] idle_spurious_count=%d (空闲期误触发触摸次数)", idle_spurious_count);
+        }
+        /* 重置本周期计数器 */
+        diag_syn_report_count = 0;
+        diag_abs_mt_count = 0;
+        diag_btn_touch_count = 0;
+        diag_other_count = 0;
+        diag_touch_judged_count = 0;
     }
     return false;
 }
 
-/* ========== is_screen_on(纯sysfs实现，彻底移除dumpsys验证) ========== */
-/* 优化: 不再调用任何dumpsys命令，纯文件读取，零fork零阻塞 */
+/* ========== is_screen_on(纯sysfs实现) ========== */
 static bool is_screen_on(void) {
     time_t now = get_now();
     if (now - last_screen_check < screen_check_sec && last_screen_check != 0) {
         return screen_state_cached;
     }
     
-    /* 纯sysfs读取背光亮度文件，微秒级永不阻塞 */
     const char* backlight_path = "/sys/class/backlight/panel0-backlight/brightness";
     int fd = open(backlight_path, O_RDONLY);
     if (fd >= 0) {
@@ -608,17 +703,14 @@ static bool is_screen_on(void) {
         close(fd);
         if (n > 0) {
             long value = strtol(buf, NULL, 10);
-            /* 亮度>0 => 屏幕开着; 亮度=0 => 屏幕关了 */
             screen_state_cached = (value > 0);
             last_screen_check = now;
             return screen_state_cached;
         }
-        /* 读取失败(文件不存在/无权限)，保守返回true */
         screen_state_cached = true;
         last_screen_check = now;
         return true;
     }
-    /* 文件不可打开(路径不存在)，保守返回true */
     screen_state_cached = true;
     last_screen_check = now;
     return true;
@@ -646,7 +738,7 @@ static void trigger_screen_off(AppConfig* app) {
     LOG_E("无法触发屏幕息屏，请检查设备权限或背光文件路径");
 }
 
-/* ========== 配置文件加载(扩展支持新参数) ========== */
+/* ========== 配置文件加载(v6修复: package值尾部\r清除 + 所有值尾部空白清除) ========== */
 static int load_config(const char* config_path) {
     FILE* fp = fopen(config_path, "r");
     if (!fp) {
@@ -665,13 +757,16 @@ static int load_config(const char* config_path) {
         char* value = strtok(NULL, "\n");
         if (!key || !value) continue;
         while (isspace(*key)) key++;
-        /* Fix6: 去掉key尾部的空格 */
+        /* 去掉key尾部的空格 */
         char* key_end = key + strlen(key) - 1;
         while (key_end > key && isspace(*key_end)) {
             *key_end = '\0';
             key_end--;
         }
         while (isspace(*value)) value++;
+        
+        /* v6修复: 去除value尾部的\r\n等空白字符(解决Windows/CRLF配置文件包名匹配失败) */
+        strip_trailing_whitespace(value);
         
         if (strcmp(key, "package") == 0) {
             if (temp_app_count < MAX_APPS) {
@@ -682,11 +777,14 @@ static int load_config(const char* config_path) {
                 current_app->start_time = 0;
                 current_app->last_touch_time = 0;
                 current_app->screen_off_triggered = false;
+                current_app->bg_mismatch_count = 0;
+                /* 热重载时保留运行状态 */
                 for (int i = 0; i < app_count; i++) {
                     if (strcmp(apps[i].package, current_app->package) == 0) {
                         current_app->start_time = apps[i].start_time;
                         current_app->last_touch_time = apps[i].last_touch_time;
                         current_app->screen_off_triggered = apps[i].screen_off_triggered;
+                        current_app->bg_mismatch_count = apps[i].bg_mismatch_count;
                         break;
                     }
                 }
@@ -728,6 +826,12 @@ static int load_config(const char* config_path) {
             if (val > 10) val = 10;
             final_check_window_s = (int)val;
             LOG_I("配置更新: final_check_window_s=%d", final_check_window_s);
+        } else if (strcmp(key, "count_syn_report_as_touch") == 0) {
+            long val = strtol(value, NULL, 10);
+            if (val < 0) val = 0;
+            if (val > 1) val = 1;
+            count_syn_report_as_touch = (int)val;
+            LOG_I("配置更新: count_syn_report_as_touch=%d", count_syn_report_as_touch);
         }
     }
     fclose(fp);
@@ -749,7 +853,7 @@ static bool check_config_updated(const char* config_path) {
     return false;
 }
 
-/* ========== main函数 ========== */
+/* ========== main函数(v6: 日志节流 + 每应用独立缓冲 + 10ms休眠) ========== */
 int main(int argc, char* argv[]) {
     char* config_path = NULL;
     for (int i = 1; i < argc; i++) {
@@ -787,16 +891,23 @@ int main(int argc, char* argv[]) {
     LOG_I("启动应用时间限制守护进程（无触控息屏模式）");
     LOG_I("参数: cmd_timeout=%dms, front_cache=%ds, screen_check=%ds, poll_interval=%ds",
           cmd_timeout_ms, front_cache_sec, screen_check_sec, max_poll_interval);
-    /* v4: 打印每个应用的limit_time配置，便于用户确认配置生效 */
-    for (int i = 0; i < app_count; i++) {
-        LOG_I("应用配置: package=%s, limit_time=%lds(%d分钟)", 
-              apps[i].package, apps[i].limit_time, (int)(apps[i].limit_time / 60));
+    /* v6: 启动时打印每个应用的完整配置 */
+    for (int idx = 0; idx < app_count; idx++) {
+        LOG_I("应用配置[%d]: package=%s, limit_time=%lds(%d分钟)", idx, 
+              apps[idx].package, apps[idx].limit_time, (int)(apps[idx].limit_time / 60));
+    }
+    LOG_I("提示: 日志已节流(仅应用变化时打印)，主循环已添加10ms休眠以减少系统负载");
+    if (count_syn_report_as_touch) {
+        LOG_I("[DIAG] 诊断模式已启用: count_syn_report_as_touch=1 (SYN_REPORT将计入触摸)");
     }
     
     init_touch_devices();
     time_t last_config_check = 0;
     char current_app[MAX_PKG_LEN];
     bool last_logged_screen_state = true;
+    
+    /* v6: 日志节流 - 仅在前台应用变化时打印 */
+    static char last_logged_app[MAX_PKG_LEN] = {0};
     
     while (1) {
         time_t now = get_now();
@@ -844,28 +955,36 @@ int main(int argc, char* argv[]) {
         time_t last_touch = now;
         has_touch = check_touch_input(&last_touch);
         
-        /* 前台应用检测 + 应用跟踪逻辑(v4修复:空检测不重置+切换缓冲) */
+        /* 前台应用检测 + 应用跟踪逻辑 */
         get_top_app_name(current_app, sizeof(current_app));
         
-        /* v4修复: 无法检测前台应用时(dumpsys繁忙/失败)，跳过本轮不重置状态 */
+        /* 空检测不重置状态 */
         if (current_app[0] == '\0') {
-            bg_mismatch_count = 0;  /* 重置缓冲计数器 */
+            /* v6: 无法检测前台应用时，重置所有应用的切换缓冲计数器 */
+            for (int _k = 0; _k < app_count; _k++) {
+                apps[_k].bg_mismatch_count = 0;
+            }
             sleep(1);
             continue;
         }
         
-        /* v4日志: 记录检测到的前台应用(便于调试) */
-        LOG_I("检测到前台应用: %s", current_app);
+        /* v6修复: 日志节流 - 仅在前台应用变化时打印 */
+        if (strcmp(current_app, last_logged_app) != 0) {
+            strncpy(last_logged_app, current_app, sizeof(last_logged_app) - 1);
+            last_logged_app[sizeof(last_logged_app) - 1] = '\0';
+            LOG_I("检测到前台应用: %s", current_app);
+        }
         
         for (int i = 0; i < app_count; i++) {
             AppConfig* app = &apps[i];
             if (strcmp(current_app, app->package) == 0) {
                 /* 匹配到目标应用 */
-                bg_mismatch_count = 0;  /* 重置缓冲计数器 */
+                app->bg_mismatch_count = 0;  /* v6: 使用 per-app 计数器 */
                 if (app->start_time == 0) {
                     app->start_time = now;
                     app->last_touch_time = now;
                     app->screen_off_triggered = false;
+                    LOG_DIAG("状态迁移: IDLE -> TRACKING (应用=%s, 剩余=%lds)", app->package, app->limit_time);
                     LOG_I("开始跟踪 %s", app->package);
                 } else {
                     if (has_touch) {
@@ -873,27 +992,29 @@ int main(int argc, char* argv[]) {
                     }
                     if (now - app->last_touch_time >= app->limit_time &&
                         !app->screen_off_triggered) {
+                        LOG_DIAG("状态迁移: TRACKING -> SCREEN_OFF (应用=%s)", app->package);
+                        LOG_DIAG("权威查询命中，触发息屏");
                         trigger_screen_off(app);
                     }
                 }
             } else {
-                /* v4修复: 使用缓冲计数器，防止偶发检测失败导致误重置 */
+                /* v6修复: 使用 per-app 缓冲计数器，防止偶发检测失败导致误重置 */
                 if (app->start_time != 0) {
-                    bg_mismatch_count++;
-                    if (bg_mismatch_count >= BG_MISMATCH_THRESHOLD) {
-                        /* 连续多次检测到非目标应用，确认真实切换后台 */
+                    app->bg_mismatch_count++;
+                    if (app->bg_mismatch_count >= BG_MISMATCH_THRESHOLD) {
                         app->start_time = 0;
                         app->last_touch_time = 0;
                         app->screen_off_triggered = false;
-                        bg_mismatch_count = 0;
-                        LOG_I("应用 %s 切换到后台，重置状态", app->package);
-                    } else {
-                        LOG_I("未检测到目标应用(第%d次/共%d次)，暂不重置", 
-                              bg_mismatch_count, BG_MISMATCH_THRESHOLD);
+                        app->bg_mismatch_count = 0;
+                        LOG_DIAG("状态迁移: TRACKING -> IDLE (原因=应用切后台, 不匹配次数=%d)", app->bg_mismatch_count);
+                        LOG_I("应用 %s 切换到后台，重置状态(第%d次不匹配)", app->package, app->bg_mismatch_count);
                     }
                 }
             }
         }
+        
+        /* v6修复: 主循环末尾10ms休眠，降低CPU占用和磁盘I/O竞争 */
+        usleep(10000);
     }
     
     cleanup_touch_devices();
