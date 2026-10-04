@@ -7,7 +7,7 @@
  *   防止长时间无人操作导致烧屏。
  *
  * 设计原则：
- *   1. 前台应用检测间隔拉长（15s），只使用轻量级 dumpsys window 命令。
+ *   1. 前台应用检测间隔拉长（30s），只使用轻量级 dumpsys window 命令。
  *   2. 屏幕状态优先读 sysfs，避免频繁 dumpsys。
  *   3. 触摸事件使用 epoll + 短超时轮询（1 秒）。
  *   4. 只在目标应用位于前台时才轮询触摸设备，其余时间低功耗休眠。
@@ -34,7 +34,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
-#include <glob.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -52,7 +51,7 @@
 
 /* 时序参数（秒 / 毫秒） */
 #define SCREEN_CHECK_INTERVAL     10   /* 屏幕状态检查间隔 */
-#define FG_CHECK_INTERVAL         15   /* 前台应用检查间隔 */
+#define FG_CHECK_INTERVAL         30   /* 前台应用检查间隔 */
 #define CONFIG_CHECK_INTERVAL     30   /* 配置文件检查间隔 */
 #define IDLE_SLEEP_SEC            5    /* 目标应用不在前台时的休眠 */
 #define TOUCH_EPOLL_TIMEOUT_MS    1000 /* 触摸轮询超时 */
@@ -159,12 +158,6 @@ static int exec_cmd(const char *cmd, char *buf, size_t bufsize) {
 
 /* ---------- 前台应用检测 ---------- */
 
-/*
- * 从 dumpsys 输出的一行中解析包名。
- * 形如：mCurrentFocus=Window{abc1234 u0 com.pkg/com.pkg.Activity}
- *       mFocusedApp=ActivityRecord{... u0 com.pkg/.Activity t123}
- *       mResumedActivity: ActivityRecord{... u0 com.pkg/.Activity t123}
- */
 static bool parse_package(const char *line, char *out, size_t outsize) {
     if (!line || !out || outsize == 0) return false;
 
@@ -195,32 +188,24 @@ static bool parse_package(const char *line, char *out, size_t outsize) {
     return true;
 }
 
-/*
- * 获取当前前台应用包名。
- * 只使用轻量级命令，避免 dumpsys activity activities 长时间持有 AMS 锁。
- * 返回 true 表示成功解析出包名。
- */
 static bool get_foreground_package(char *out, size_t outsize) {
     if (!out || outsize == 0) return false;
     out[0] = '\0';
 
     char buf[CMD_BUFFER_SIZE];
 
-    /* 优先级 1：mCurrentFocus（最轻） */
     if (exec_cmd("/system/bin/dumpsys window 2>/dev/null | grep -m1 mCurrentFocus",
                  buf, sizeof(buf)) == 0) {
         char *p = strstr(buf, "mCurrentFocus=");
         if (p && parse_package(p + 15, out, outsize)) return true;
     }
 
-    /* 优先级 2：mFocusedApp */
     if (exec_cmd("/system/bin/dumpsys window 2>/dev/null | grep -m1 mFocusedApp",
                  buf, sizeof(buf)) == 0) {
         char *p = strstr(buf, "mFocusedApp=");
         if (p && parse_package(p + 12, out, outsize)) return true;
     }
 
-    /* 优先级 3：mResumedActivity（只 grep 一行，不 dump 整个 activity 栈） */
     if (exec_cmd("/system/bin/dumpsys activity 2>/dev/null | grep -m1 mResumedActivity",
                  buf, sizeof(buf)) == 0) {
         char *p = strstr(buf, "mResumedActivity:");
@@ -236,29 +221,36 @@ static bool get_foreground_package(char *out, size_t outsize) {
 /*
  * 检测屏幕是否亮着。
  * 优先读 sysfs，失败时回退到 dumpsys power。
+ * 【已修复】使用 opendir/readdir 替代 Android 不支持的 glob.h
  */
 static bool get_screen_state(void) {
-    /* 优先 sysfs，快速且不涉及 system_server */
-    glob_t g;
-    bool found = false;
     bool on = true;
+    bool found = false;
 
-    if (glob("/sys/class/backlight/*/brightness", 0, NULL, &g) == 0) {
-        for (size_t i = 0; i < g.gl_pathc; i++) {
-            int fd = open(g.gl_pathv[i], O_RDONLY);
-            if (fd < 0) continue;
-            char buf[32] = {0};
-            ssize_t r = read(fd, buf, sizeof(buf) - 1);
-            close(fd);
-            if (r > 0) {
-                on = (strtol(buf, NULL, 10) > 0);
-                found = true;
-                break;
+    /* 扫描 /sys/class/backlight/ 下的所有子目录 */
+    DIR *dir = opendir("/sys/class/backlight");
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
+            char path[256];
+            snprintf(path, sizeof(path), "/sys/class/backlight/%s/brightness", entry->d_name);
+            int fd = open(path, O_RDONLY);
+            if (fd >= 0) {
+                char buf[32] = {0};
+                ssize_t r = read(fd, buf, sizeof(buf) - 1);
+                close(fd);
+                if (r > 0) {
+                    on = (strtol(buf, NULL, 10) > 0);
+                    found = true;
+                    break;
+                }
             }
         }
-        globfree(&g);
+        closedir(dir);
     }
 
+    /* 备用路径：部分设备位于 leds 目录下 */
     if (!found) {
         int fd = open("/sys/class/leds/lcd-backlight/brightness", O_RDONLY);
         if (fd >= 0) {
@@ -362,10 +354,6 @@ static bool init_touch_devices(void) {
     return true;
 }
 
-/*
- * 在 timeout_ms 内等待触摸事件。
- * 返回 true 表示检测到触摸，false 表示超时或无触摸。
- */
 static bool poll_touch(int timeout_ms) {
     if (epfd < 0 && !init_touch_devices()) {
         return false;
@@ -398,12 +386,10 @@ static bool poll_touch(int timeout_ms) {
 /* ---------- 熄屏 ---------- */
 
 static void trigger_screen_off(void) {
-    /* KEYCODE_POWER = 26 */
     if (exec_cmd("/system/bin/input keyevent 26", NULL, 0) == 0) {
         sleep(SCREEN_OFF_VERIFY_WAIT);
         return;
     }
-    /* 备用命令 */
     exec_cmd("/system/bin/input keyevent KEYCODE_POWER", NULL, 0);
     sleep(SCREEN_OFF_VERIFY_WAIT);
 }
@@ -419,7 +405,7 @@ static long parse_time_str(const char *s) {
         case 'h': case 'H': return v * 3600;
         case 'm': case 'M': return v * 60;
         case 's': case 'S': return v;
-        default:            return v * 60; /* 无单位默认分钟 */
+        default:            return v * 60;
     }
 }
 
@@ -465,7 +451,6 @@ static int load_config(const char *path) {
             memset(cur, 0, sizeof(*cur));
             strncpy(cur->package, val, MAX_PKG_LEN - 1);
             cur->limit_time = DEFAULT_LIMIT_SEC;
-            /* 从旧数组继承运行时状态 */
             for (int i = 0; i < app_count; i++) {
                 if (strcmp(apps[i].package, cur->package) == 0) {
                     cur->last_touch = apps[i].last_touch;
@@ -481,7 +466,6 @@ static int load_config(const char *path) {
     }
     fclose(fp);
 
-    /* 原子替换 */
     if (n < app_count) {
         memset(&apps[n], 0, sizeof(AppConfig) * (app_count - n));
     }
@@ -490,8 +474,7 @@ static int load_config(const char *path) {
 
     LOG_I("加载配置: %d 个应用", n);
     for (int i = 0; i < n; i++) {
-        LOG_I("  %s limit=%ld 秒",
-              apps[i].package, (long)apps[i].limit_time);
+        LOG_I("  %s limit=%ld 秒", apps[i].package, (long)apps[i].limit_time);
     }
     return 0;
 }
@@ -499,9 +482,7 @@ static int load_config(const char *path) {
 /* ---------- 主程序 ---------- */
 
 static void usage(const char *prog) {
-    fprintf(stderr,
-            "用法: %s --config=<路径> [--log=<路径>] [--debug=true|false]\n",
-            prog);
+    fprintf(stderr, "用法: %s --config=<路径> [--log=<路径>] [--debug=true|false]\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -526,8 +507,7 @@ int main(int argc, char *argv[]) {
     if (log_enabled && log_file_path[0]) {
         log_fp = fopen(log_file_path, "a");
         if (!log_fp) {
-            fprintf(stderr, "无法打开日志文件 %s: %s\n",
-                    log_file_path, strerror(errno));
+            fprintf(stderr, "无法打开日志文件 %s: %s\n", log_file_path, strerror(errno));
             return 1;
         }
     }
@@ -549,7 +529,6 @@ int main(int argc, char *argv[]) {
 
     LOG_I("启动应用时间限制守护进程");
 
-    /* 运行时状态 */
     bool screen_on = true;
     time_t last_screen_check = 0;
     time_t last_fg_check = 0;
@@ -560,7 +539,6 @@ int main(int argc, char *argv[]) {
     while (1) {
         time_t now = time(NULL);
 
-        /* --- 1. 屏幕状态检查 --- */
         if (now - last_screen_check >= SCREEN_CHECK_INTERVAL) {
             bool s = get_screen_state();
             if (s != screen_on) {
@@ -570,7 +548,6 @@ int main(int argc, char *argv[]) {
             last_screen_check = now;
         }
 
-        /* --- 屏幕关闭：重置所有状态，休眠 --- */
         if (!screen_on) {
             for (int i = 0; i < app_count; i++) {
                 if (apps[i].tracking) {
@@ -587,7 +564,6 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        /* --- 2. 配置检查 --- */
         if (now - last_cfg_check >= CONFIG_CHECK_INTERVAL) {
             struct stat cst;
             if (stat(config_file_path, &cst) == 0 &&
@@ -595,7 +571,6 @@ int main(int argc, char *argv[]) {
                 LOG_I("配置文件已更新，重新加载");
                 last_config_mtime = cst.st_mtime;
                 load_config(config_file_path);
-                /* 重新匹配 active_app */
                 active_app = NULL;
                 for (int i = 0; i < app_count; i++) {
                     if (strcmp(current_pkg, apps[i].package) == 0) {
@@ -607,7 +582,6 @@ int main(int argc, char *argv[]) {
             last_cfg_check = now;
         }
 
-        /* --- 3. 前台应用检查 --- */
         if (now - last_fg_check >= FG_CHECK_INTERVAL) {
             char pkg[MAX_PKG_LEN] = {0};
             if (get_foreground_package(pkg, sizeof(pkg)) && pkg[0]) {
@@ -616,7 +590,6 @@ int main(int argc, char *argv[]) {
                     current_pkg[sizeof(current_pkg) - 1] = '\0';
                     LOG_I("前台应用: %s", current_pkg);
 
-                    /* 切换到新的目标应用 */
                     AppConfig *new_active = NULL;
                     for (int i = 0; i < app_count; i++) {
                         if (strcmp(current_pkg, apps[i].package) == 0) {
@@ -638,21 +611,18 @@ int main(int argc, char *argv[]) {
                             active_app->triggered  = false;
                             active_app->last_touch = now;
                             LOG_I("开始跟踪 %s (limit=%ld 秒)",
-                                  active_app->package,
-                                  (long)active_app->limit_time);
+                                  active_app->package, (long)active_app->limit_time);
                         }
                     }
                 }
             }
-            /* 命令失败时保留旧的 current_pkg，不误判为无前台应用 */
             last_fg_check = now;
         }
 
-        /* --- 4. 触摸轮询与超时判断 --- */
         if (active_app) {
             if (poll_touch(TOUCH_EPOLL_TIMEOUT_MS)) {
                 active_app->last_touch = time(NULL);
-                active_app->triggered  = false; /* 用户还醒着，允许后续再次触发 */
+                active_app->triggered  = false;
             }
 
             time_t t_now = time(NULL);
@@ -662,11 +632,9 @@ int main(int argc, char *argv[]) {
                       active_app->package, (long)active_app->limit_time);
                 trigger_screen_off();
                 active_app->triggered = true;
-                /* 立即重新检查屏幕状态 */
                 last_screen_check = 0;
             }
         } else {
-            /* 目标应用不在前台，低功耗休眠 */
             sleep(2);
         }
     }
