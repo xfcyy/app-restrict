@@ -1,6 +1,6 @@
 /*
  * App_restrict - 短视频应用无触控息屏守护进程
- * 【第二版 - 前台检测顺序优化，其余保持原状】
+ * 【第三版 - 多源交叉验证屏幕状态，修复亮屏后程序假死问题】
  */
 
 #include <stdio.h>
@@ -159,10 +159,8 @@ static bool is_valid_package(const char *pkg) {
 }
 
 /* 
- * 【第二版修改点】：前台应用检测梯次退让逻辑（轻 -> 中 -> 重）
- * 1. mCurrentFocus (最轻量)
- * 2. mFocusedApp (中等)
- * 3. mResumedActivity (最重，仅在前两者失效时立即执行，无周期等待)
+ * 前台应用检测梯次退让逻辑（轻 -> 中 -> 重）
+ * 严格按照一次调用内即时级联，绝不引入等待周期
  */
 static bool get_foreground_package(char *out, size_t outsize) {
     if (!out || outsize == 0) return false;
@@ -197,10 +195,31 @@ static bool get_foreground_package(char *out, size_t outsize) {
     return false;
 }
 
-/* 屏幕状态检测（完全保持原逻辑，绝不妥协防烧屏底线） */
+/* 
+ * 【第三版核心修改】：多源交叉验证屏幕状态
+ * 1. /sys/class/graphics/fb0/blank (物理层，最权威)
+ * 2. /sys/class/backlight/*/brightness (背光层，轻量)
+ * 3. dumpsys display | grep mScreenState (系统显示层，解决唤醒延迟)
+ * 4. dumpsys power | grep mWakefulness (系统电源层)
+ * 5. 终极兜底：返回 true (防烧屏底线)
+ */
 static bool get_screen_state(void) {
     bool on = true;
     bool found = false;
+
+    // 1. 物理层：fb0/blank (0为亮，非0为灭)
+    int fd = open("/sys/class/graphics/fb0/blank", O_RDONLY);
+    if (fd >= 0) {
+        char buf[32] = {0};
+        ssize_t r = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (r > 0) {
+            int val = strtol(buf, NULL, 10);
+            return (val == 0); // 0为亮屏，其他状态直接返回
+        }
+    }
+
+    // 2. 背光层：扫描 /sys/class/backlight/ 和 /sys/class/leds/
     DIR *dir = opendir("/sys/class/backlight");
     if (dir) {
         struct dirent *entry;
@@ -208,35 +227,41 @@ static bool get_screen_state(void) {
             if (entry->d_name[0] == '.') continue;
             char path[256];
             snprintf(path, sizeof(path), "/sys/class/backlight/%s/brightness", entry->d_name);
-            int fd = open(path, O_RDONLY);
-            if (fd >= 0) {
+            int f = open(path, O_RDONLY);
+            if (f >= 0) {
                 char buf[32] = {0};
-                ssize_t r = read(fd, buf, sizeof(buf) - 1);
-                close(fd);
+                ssize_t r = read(f, buf, sizeof(buf) - 1);
+                close(f);
                 if (r > 0) { on = (strtol(buf, NULL, 10) > 0); found = true; break; }
             }
         }
         closedir(dir);
     }
     if (!found) {
-        int fd = open("/sys/class/leds/lcd-backlight/brightness", O_RDONLY);
-        if (fd >= 0) {
+        int f = open("/sys/class/leds/lcd-backlight/brightness", O_RDONLY);
+        if (f >= 0) {
             char buf[32] = {0};
-            ssize_t r = read(fd, buf, sizeof(buf) - 1);
-            close(fd);
+            ssize_t r = read(f, buf, sizeof(buf) - 1);
+            close(f);
             if (r > 0) { on = (strtol(buf, NULL, 10) > 0); found = true; }
         }
     }
     if (found) return on;
-    
-    // 失败回退 dumpsys power
+
+    // 3. 系统显示层：dumpsys display（专治亮屏后 mWakefulness 延迟问题）
     char out[512] = {0};
+    if (exec_cmd("/system/bin/dumpsys display 2>/dev/null | grep -m1 mScreenState", out, sizeof(out)) == 0) {
+        if (strstr(out, "mScreenState=ON")) return true;
+        if (strstr(out, "mScreenState=OFF")) return false;
+    }
+
+    // 4. 系统电源层：dumpsys power 兜底
     if (exec_cmd("/system/bin/dumpsys power 2>/dev/null | grep -m1 mWakefulness", out, sizeof(out)) == 0) {
         if (strstr(out, "mWakefulness=Awake")) return true;
         if (strstr(out, "mWakefulness=Asleep") || strstr(out, "mWakefulness=Dozing")) return false;
     }
-    
-    // 终极兜底：为了防烧屏，宁可耗电，也假设屏幕亮着继续监控
+
+    // 5. 终极兜底：防烧屏底线，假定屏幕亮着继续监控
     return true; 
 }
 
@@ -352,7 +377,7 @@ static int load_config(const char *path) {
         trim_inplace(val);
         if (key[0] == '\0') continue;
 
-        /* 解析全局时序配置（保持读取配置文件，不硬编码） */
+        /* 解析全局时序配置（保持读取配置文件） */
         if (strcmp(key, "screen_interval") == 0) {
             int v = atoi(val); if (v > 0) g_screen_check_interval = v;
         } else if (strcmp(key, "fg_interval") == 0) {
@@ -507,7 +532,7 @@ int main(int argc, char *argv[]) {
                 LOG_I("%s 超过 %ld 秒无触摸，触发熄屏", active_app->package, (long)active_app->limit_time);
                 trigger_screen_off();
                 active_app->triggered = true;
-                last_screen_check = 0;
+                last_screen_check = 0; // 强制下一轮立刻重新检查屏幕状态
             }
         } else {
             sleep(2);
