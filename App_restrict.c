@@ -21,7 +21,7 @@
 #include <linux/limits.h>
 
 /* ===== 日志 ===== */
-#define LOG_FILE "/data/adb/modules/App_screen_off/app_screen_off.log"
+#define LOG_FILE "/data/adb/modules/App_screen_off_Aloazny/app_screen_off.log"
 #define MAX_LOG_SIZE (100 * 1024)
 
 #define LOG_I(fmt, ...) do_log("I", fmt, ##__VA_ARGS__)
