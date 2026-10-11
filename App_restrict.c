@@ -31,13 +31,14 @@
 #define SLEEP_INTERVAL_SCREEN_OFF 30
 #define LOG_SUPPRESS_INTERVAL 60
 
-#define DEFAULT_LIMIT_TIME      (15 * 60)  /* 默认停留时限 15 分钟 */
-#define TOP_PKG_CACHE_TTL       3          /* 跟踪态前台应用缓存 */
-#define TOP_PKG_IDLE_CACHE_TTL  5          /* 待机态前台应用缓存 */
-#define IDLE_POLL_INTERVAL      2          /* 待机轮询间隔 */
-#define FULL_SCAN_BACKOFF       30         /* 4 条命令全失败后的退避 */
-#define GETEVENT_RETRY_INTERVAL 5          /* getevent 启动失败重试间隔 */
-#define MAX_TRIGGER_ATTEMPTS    3          /* 息屏触发最大尝试次数 */
+#define DEFAULT_LIMIT_TIME          (15 * 60)  /* 默认停留时限 15 分钟 */
+#define TOP_PKG_CACHE_TTL           3          /* 跟踪态前台应用缓存 */
+#define TOP_PKG_IDLE_CACHE_TTL      5          /* 待机态前台应用缓存 */
+#define IDLE_POLL_INTERVAL          2          /* 待机轮询间隔 */
+#define FULL_SCAN_BACKOFF           30         /* 4 条命令全失败后的退避 */
+#define GETEVENT_RETRY_INTERVAL     5          /* getevent 启动失败重试间隔 */
+#define MAX_TRIGGER_ATTEMPTS        3          /* 息屏触发最大尝试次数 */
+#define SCREEN_OFF_HEARTBEAT_LOG    600        /* 灭屏休眠心跳日志间隔 */
 
 #define LOG_I(fmt, ...) do { if (log_enabled) write_log("[I] " fmt, ##__VA_ARGS__); } while (0)
 #define LOG_W(fmt, ...) do { if (log_enabled) write_log("[W] " fmt, ##__VA_ARGS__); } while (0)
@@ -72,8 +73,10 @@ static time_t last_screen_check = 0;
 
 static time_t last_cmd_fail_log = 0;
 static time_t last_backlight_fail_log = 0;
+static time_t last_screen_off_heartbeat = 0;
 
 static volatile sig_atomic_t g_stop_requested = 0;
+static int instance_lock_fd = -1;
 
 typedef struct {
     char package[MAX_PKG_LEN];
@@ -134,7 +137,6 @@ static void write_log(const char* fmt, ...) {
         fflush(log_fp);
         log_writing = false;
     } else {
-        /* 未指定 --log= 时回落到 stderr，避免调试信息静默丢失 */
         fprintf(stderr, "[%s] ", get_timestamp());
         vfprintf(stderr, fmt, args);
         fprintf(stderr, "\n");
@@ -166,8 +168,7 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
     size_t total = 0;
     char tmp[512];
     size_t n;
-    /* 关键：无论缓冲区是否写满，都必须读到 EOF，否则子进程阻塞在 write，
-       pclose 的 waitpid 与之互相等待造成死锁 */
+    /* 必须读到 EOF 再 pclose，避免管道写满死锁 */
     while ((n = fread(tmp, 1, sizeof(tmp), pipe)) > 0) {
         if (buf && buf_size > 0 && total < buf_size - 1) {
             size_t copy = n;
@@ -192,8 +193,6 @@ static int exec_cmd(const char* cmd, char* buf, size_t buf_size) {
 }
 
 /* ---------- 前台应用识别 ---------- */
-/* 在 text 所在行内提取第一个"形如包名"的 token：
-   以字母/下划线开头，含 '.'，仅由字母数字下划线和 '.' 组成 */
 static bool extract_package_from(const char* text, char* buf, size_t buf_size) {
     const char* p = text;
     while (*p && *p != '\n') {
@@ -237,7 +236,6 @@ static char* get_top_app_name(char* buf, size_t buf_size, int cache_ttl) {
     };
     const int cmd_count = 4;
 
-    /* 上一轮全链失败后进入退避，退避期内只尝试最快的第一条命令 */
     int limit = (now < full_scan_lock_until) ? 1 : cmd_count;
 
     for (int i = 0; i < limit; i++) {
@@ -264,7 +262,6 @@ static char* get_top_app_name(char* buf, size_t buf_size, int cache_ttl) {
         }
     }
 
-    /* 失败结果同样入缓存（负缓存），避免进程风暴 */
     buf[0] = '\0';
     cached_top_pkg[0] = '\0';
     last_top_pkg_time = now;
@@ -274,7 +271,6 @@ static char* get_top_app_name(char* buf, size_t buf_size, int cache_ttl) {
 }
 
 /* ---------- 时间解析 ---------- */
-/* 成功返回秒数；失败返回 -1 */
 static long parse_time(const char* time_str) {
     if (!time_str) return -1;
     while (isspace((unsigned char)*time_str)) time_str++;
@@ -285,11 +281,11 @@ static long parse_time(const char* time_str) {
     if (endptr == time_str || value < 0) return -1;
 
     while (isspace((unsigned char)*endptr)) endptr++;
-    if (*endptr == '\0') return value * 60;                 /* 无后缀按分钟 */
+    if (*endptr == '\0') return value * 60;
     if ((endptr[0] == 'h' || endptr[0] == 'H') && endptr[1] == '\0') return value * 3600;
     if ((endptr[0] == 'm' || endptr[0] == 'M') && endptr[1] == '\0') return value * 60;
     if ((endptr[0] == 's' || endptr[0] == 'S') && endptr[1] == '\0') return value;
-    return -1;                                              /* 非法后缀 */
+    return -1;
 }
 
 /* ---------- 触摸设备（主路径） ---------- */
@@ -448,7 +444,7 @@ static bool check_touch_input(time_t* last_touch) {
     }
     if (use_getevent && getevent_fd < 0) {
         if (!init_getevent()) {
-            sleep(GETEVENT_RETRY_INTERVAL);   /* 防止忙循环 */
+            sleep(GETEVENT_RETRY_INTERVAL);
             return false;
         }
     }
@@ -464,7 +460,7 @@ static bool check_touch_input(time_t* last_touch) {
         LOG_E("epoll_wait 失败: %s", strerror(errno));
         cleanup_touch_devices();
         use_getevent = true;
-        sleep(1);                              /* 防止忙循环 */
+        sleep(1);
         return false;
     }
     if (nfds <= 0) return false;
@@ -484,7 +480,6 @@ static bool check_touch_input(time_t* last_touch) {
                 } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 1) {
                     touch_detected = true;
                 }
-                /* 不把 EV_SYN/SYN_REPORT 当作触摸，避免悬停/噪声误判 */
             }
             if (errno != EAGAIN) {
                 cleanup_touch_devices();
@@ -504,7 +499,7 @@ static bool check_touch_input(time_t* last_touch) {
         }
     }
     if (touch_detected) {
-        *last_touch = time(NULL);              /* 返回真实触摸时刻 */
+        *last_touch = time(NULL);
         return true;
     }
     return false;
@@ -547,10 +542,10 @@ static int load_config(const char* config_path) {
 
     while (fgets(line, sizeof(line), fp)) {
         line_no++;
-        char* trimmed = trim(line);            /* 去首尾空白与 \r */
+        char* trimmed = trim(line);
         if (*trimmed == '\0' || *trimmed == '#') continue;
 
-        char* eq = strchr(trimmed, '=');       /* 只在第一个 '=' 处切分 */
+        char* eq = strchr(trimmed, '=');
         if (!eq) {
             LOG_E("配置第 %d 行缺少 '='，已忽略: %s", line_no, trimmed);
             continue;
@@ -570,7 +565,7 @@ static int load_config(const char* config_path) {
             for (int i = 0; i < temp_count; i++) {
                 if (strcmp(temp_apps[i].package, value) == 0) { cur = &temp_apps[i]; break; }
             }
-            if (cur) continue;                 /* 同名复用 */
+            if (cur) continue;
             if (temp_count >= MAX_APPS) {
                 LOG_E("应用数量超过 %d，忽略 %s", MAX_APPS, value);
                 cur = NULL;
@@ -580,8 +575,7 @@ static int load_config(const char* config_path) {
             memset(cur, 0, sizeof(*cur));
             snprintf(cur->package, sizeof(cur->package), "%s", value);
             cur->limit_time = DEFAULT_LIMIT_TIME;
-            cur->no_touch_time = -1;           /* -1 表示未配置，稍后取 limit_time */
-            /* 从旧配置继承运行状态，保证热更新不丢计时 */
+            cur->no_touch_time = -1;
             AppConfig* old = find_app(value);
             if (old) {
                 cur->start_time = old->start_time;
@@ -632,7 +626,7 @@ static bool check_config_updated(const char* config_path) {
     return false;
 }
 
-/* ---------- 屏幕状态判定（三态） ---------- */
+/* ---------- 屏幕状态判定（三态：1=亮 0=灭 -1=未知） ---------- */
 static void invalidate_screen_cache(void) {
     last_screen_check = 0;
 }
@@ -651,31 +645,11 @@ static bool read_long_file(const char* path, long* out) {
     return true;
 }
 
-/* 返回：1=确认亮屏 0=确认灭屏 -1=无法判定；source 写入判定依据供日志 */
 static int query_screen_state(char* source, size_t source_size) {
+    char out[512];
     long v = 0;
 
-    /* 1) actual_brightness：面板真实亮度，息屏后为 0，最可靠 */
-    if (read_long_file("/sys/class/backlight/panel0-backlight/actual_brightness", &v)) {
-        snprintf(source, source_size, "actual_brightness=%ld", v);
-        return v > 0 ? 1 : 0;
-    }
-    /* 2) bl_power：非 0 表示面板已 blank（FB_BLANK_POWERDOWN=4） */
-    if (read_long_file("/sys/class/backlight/panel0-backlight/bl_power", &v)) {
-        if (v != 0) {
-            snprintf(source, source_size, "bl_power=%ld", v);
-            return 0;
-        }
-    }
-    /* 3) brightness：部分机型息屏后仍保留设定值，只把 0 当作可信的"灭屏" */
-    if (read_long_file("/sys/class/backlight/panel0-backlight/brightness", &v)) {
-        if (v == 0) {
-            snprintf(source, source_size, "brightness=0");
-            return 0;
-        }
-    }
-    /* 4) dumpsys power */
-    char out[512];
+    /* 1) 权威来源：PowerManagerService 的 mWakefulness */
     out[0] = '\0';
     if (exec_cmd("dumpsys power | grep mWakefulness=", out, sizeof(out)) == 0) {
         if (strstr(out, "mWakefulness=Awake")) {
@@ -691,7 +665,7 @@ static int query_screen_state(char* source, size_t source_size) {
             return 0;
         }
     }
-    /* 5) dumpsys display */
+    /* 2) dumpsys display */
     out[0] = '\0';
     if (exec_cmd("dumpsys display | grep mScreenState", out, sizeof(out)) == 0) {
         if (strstr(out, "mScreenState=ON")) {
@@ -703,7 +677,7 @@ static int query_screen_state(char* source, size_t source_size) {
             return 0;
         }
     }
-    /* 6) dumpsys window */
+    /* 3) dumpsys window */
     out[0] = '\0';
     if (exec_cmd("dumpsys window | grep mScreenOnEarly", out, sizeof(out)) == 0) {
         if (strstr(out, "mScreenOnEarly=true")) {
@@ -715,9 +689,22 @@ static int query_screen_state(char* source, size_t source_size) {
             return 0;
         }
     }
-
-    snprintf(source, source_size,
-             "actual_brightness/bl_power 不可用, power/display/window 均无匹配");
+    /* 4) 背光弱判定：仅在 dumpsys 全部失效时使用。
+       注意：部分机型 actual_brightness 恒为 0、brightness 保留设定值，
+       因此单凭它们的 0/非 0 不能可靠区分亮灭屏 */
+    if (read_long_file("/sys/class/backlight/panel0-backlight/bl_power", &v) && v != 0) {
+        snprintf(source, source_size, "bl_power=%ld", v);
+        return 0;                                  /* 面板已 blank */
+    }
+    if (read_long_file("/sys/class/backlight/panel0-backlight/actual_brightness", &v) && v > 0) {
+        snprintf(source, source_size, "actual_brightness=%ld", v);
+        return 1;                                  /* 背光确实在点亮 */
+    }
+    if (read_long_file("/sys/class/backlight/panel0-backlight/brightness", &v) && v == 0) {
+        snprintf(source, source_size, "brightness=0");
+        return 0;                                  /* 亮度为 0 视为灭屏（弱） */
+    }
+    snprintf(source, source_size, "power/display/window 均无匹配, 背光节点不可判定");
     return -1;
 }
 
@@ -728,7 +715,7 @@ static bool is_screen_on(void) {
     }
     char source[160];
     int st = query_screen_state(source, sizeof(source));
-    screen_state_cached = (st != 0);          /* 无法判定时保守按亮屏处理 */
+    screen_state_cached = (st != 0);               /* 无法判定时保守按亮屏处理 */
     if (st < 0 && now - last_backlight_fail_log >= LOG_SUPPRESS_INTERVAL) {
         LOG_W("屏幕状态无法判定，保守按亮屏处理（%s）", source);
         last_backlight_fail_log = now;
@@ -742,7 +729,7 @@ static void trigger_screen_off(AppConfig* app) {
     char source[160];
     int st = query_screen_state(source, sizeof(source));
 
-    if (st == 0) {                            /* 已经是灭屏 */
+    if (st == 0) {
         app->screen_off_triggered = true;
         app->start_time = 0;
         app->last_touch_time = 0;
@@ -752,17 +739,16 @@ static void trigger_screen_off(AppConfig* app) {
     }
 
     app->trigger_attempts++;
-    /* KEYCODE_SLEEP(223) 是"强制睡眠"而非切换键，屏幕已灭时重复发送无副作用 */
+    /* KEYCODE_SLEEP(223) 为非切换键，屏幕已灭时重复发送无副作用 */
     int ret = exec_cmd("input keyevent 223", NULL, 0);
     const char* used_key = "keyevent 223 (SLEEP)";
     if (ret != 0 && st == 1) {
-        /* 只有"确认亮屏"时才允许使用切换键 26，避免把已息屏的屏幕唤醒 */
         ret = exec_cmd("input keyevent 26", NULL, 0);
         used_key = "keyevent 26 (POWER)";
     }
     if (ret != 0) {
         LOG_E("发送息屏指令失败（%s 执行出错），请检查设备权限", used_key);
-        app->last_touch_time = time(NULL);    /* 宽限期后重试 */
+        app->last_touch_time = time(NULL);
         return;
     }
 
@@ -798,18 +784,43 @@ static void trigger_screen_off(AppConfig* app) {
         LOG_W("已发送息屏指令（%s），无法确认屏幕状态（%s），按已息屏处理，不再重试",
               used_key, source);
     }
-    /* 收尾：标记已触发，杜绝夜间反复发送按键（含切换键唤醒风险） */
     app->screen_off_triggered = true;
     app->start_time = 0;
     app->last_touch_time = 0;
     app->trigger_attempts = 0;
 }
 
-/* ---------- 退出信号处理（SIGTERM/SIGINT） ---------- */
+/* ---------- 单实例锁 ---------- */
+static bool acquire_instance_lock(const char* config_path) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s.lock", config_path);
+    int fd = open(path, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        LOG_W("无法创建实例锁文件 %s: %s（跳过单实例检查）", path, strerror(errno));
+        return true;
+    }
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    if (fcntl(fd, F_SETLK, &fl) < 0) {
+        LOG_E("已有另一实例正在运行（锁文件 %s 被占用），本实例退出", path);
+        close(fd);
+        return false;
+    }
+    char pidbuf[32];
+    int len = snprintf(pidbuf, sizeof(pidbuf), "%d\n", (int)getpid());
+    if (ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) == 0) {
+        (void)!write(fd, pidbuf, (size_t)len);
+    }
+    instance_lock_fd = fd;
+    return true;
+}
+
+/* ---------- 退出信号处理 ---------- */
 static void handle_stop_signal(int sig) {
     (void)sig;
     if (g_stop_requested) {
-        /* 第二次收到信号：不再等待，直接退出（由启动脚本兜底回收子进程） */
         _exit(1);
     }
     g_stop_requested = 1;
@@ -820,7 +831,7 @@ static void install_signal_handlers(void) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_stop_signal;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;   /* 不用 SA_RESTART：让 epoll_wait/read/sleep 被 EINTR 中断，尽快退出 */
+    sa.sa_flags = 0;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 }
@@ -853,6 +864,12 @@ int main(int argc, char* argv[]) {
     } else if (log_enabled) {
         fprintf(stderr, "提示：未指定 --log=，日志将输出到 stderr\n");
     }
+
+    if (!acquire_instance_lock(config_path)) {
+        if (log_fp) fclose(log_fp);
+        return 1;
+    }
+
     if (load_config(config_path) != 0) {
         if (log_fp) fclose(log_fp);
         return 1;
@@ -880,7 +897,7 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        /* ① 屏幕状态（带 5s 缓存） */
+        /* ① 屏幕状态（5s 缓存） */
         bool screen_on = is_screen_on();
         if (screen_on != last_logged_screen_state) {
             LOG_I("屏幕状态变为: %s", screen_on ? "开启" : "关闭");
@@ -891,6 +908,11 @@ int main(int argc, char* argv[]) {
             cleanup_touch_devices();
             use_getevent = false;
             tracking_active = false;
+            time_t hb = time(NULL);
+            if (hb - last_screen_off_heartbeat >= SCREEN_OFF_HEARTBEAT_LOG) {
+                LOG_I("屏幕关闭，休眠中（等待亮屏唤醒）");
+                last_screen_off_heartbeat = hb;
+            }
             sleep(SLEEP_INTERVAL_SCREEN_OFF);
             continue;
         }
@@ -905,7 +927,7 @@ int main(int argc, char* argv[]) {
             last_config_check = now;
         }
 
-        /* ③ 前台应用识别（跟踪态 3s / 待机态 5s 缓存） */
+        /* ③ 前台应用识别 */
         current_app[0] = '\0';
         if (get_top_app_name(current_app, sizeof(current_app),
                              tracking_active ? TOP_PKG_CACHE_TTL : TOP_PKG_IDLE_CACHE_TTL) == NULL) {
@@ -915,7 +937,7 @@ int main(int argc, char* argv[]) {
 
         AppConfig* cur = current_app[0] ? find_app(current_app) : NULL;
         if (!cur) {
-            /* ④ 不在受管应用内（如游戏）：不碰输入设备、不做触摸检测，待机轮询 */
+            /* ④ 不在受管应用内：待机轮询 */
             if (tracking_active) {
                 reset_all_apps("切换到后台");
                 cleanup_touch_devices();
@@ -926,13 +948,13 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        /* ⑤ 受管应用在前台：进入/维持跟踪 */
+        /* ⑤ 受管应用在前台：跟踪 */
         tracking_active = true;
         if (touch_fd_count == 0 && !use_getevent) init_touch_devices();
 
         time_t last_touch = 0;
         bool has_touch = check_touch_input(&last_touch);
-        now = time(NULL);                      /* 重新取时间，消除 epoll 阻塞造成的偏差 */
+        now = time(NULL);
         if (g_stop_requested) continue;
 
         for (int i = 0; i < app_count; i++) {
